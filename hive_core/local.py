@@ -104,16 +104,21 @@ def cmd_start(args: dict) -> dict:
     endpoint = f"http://{listen}" if not listen.startswith("http") else listen
     # local daemon lock: holder pid means an in-flight serve process
     lock = DaemonLock(home)
-    pid = lock.holder_pid()
-    if pid and process_alive(pid):
-        if not _wait_ready(endpoint, pid, deadline=8.0):
-            raise HiveError("SERVICE_UNAVAILABLE", "服务进程在但健康检查未通过")
-        return {"service_pid": pid, "endpoint": endpoint, "ready": True,
-                "already_running": True}
-    if probe_health(endpoint):
-        # service reachable but lock not visible (e.g. restored home)
-        return {"service_pid": None, "endpoint": endpoint, "ready": True,
-                "already_running": True}
+    for _round in range(3):
+        pid = lock.holder_pid()
+        if pid and process_alive(pid):
+            if _wait_ready(endpoint, pid, deadline=8.0):
+                return {"service_pid": pid, "endpoint": endpoint,
+                        "ready": True, "already_running": True}
+            if not process_alive(pid):
+                continue  # holder died mid-wait (stop in progress) -> respawn
+            raise HiveError("SERVICE_UNAVAILABLE",
+                            "服务进程在但健康检查未通过")
+        if probe_health(endpoint):
+            # service reachable but lock not visible (e.g. restored home)
+            return {"service_pid": None, "endpoint": endpoint, "ready": True,
+                    "already_running": True}
+        break
     cli = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "cli", "hive.py")
     log_out = open(os.path.join(home, "logs", "daemon.out.log"), "a", encoding="utf-8")

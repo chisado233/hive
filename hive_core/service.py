@@ -132,17 +132,24 @@ class Service:
         idem_key = None
         if not is_query and request_id:
             idem_key = (subject.subject_id, command, request_id)
-            existing = self._idem_lookup(idem_key, payload_hash)
-            if existing is not None:
-                resp, done = existing
-                if done:
-                    return resp, False
+            replay = self._idem_reserve_or_replay(idem_key, payload_hash)
+            if replay is not None:
+                return replay, False
 
         handler = self.handlers.get(command)
         if handler is None:
             raise HiveError("NOT_IMPLEMENTED", f"命令已定义但尚未实现: {command}")
         args = validate_arguments(cmd, normalized) if cmd else normalized
-        result = handler(self, subject, args, request_id)
+        try:
+            result = handler(self, subject, args, request_id)
+        except BaseException:
+            # free the reservation so a same-key retry can proceed cleanly
+            if idem_key:
+                with self.store.write() as cur:
+                    cur.execute("DELETE FROM idempotency WHERE subject_id=? "
+                                "AND command=? AND request_id=? AND response "
+                                "IS NULL", idem_key)
+            raise
 
         if idem_key:
             self._idem_store(idem_key, payload_hash, result)
@@ -152,30 +159,43 @@ class Service:
                             {"retryable": True})
         return result, True
 
-    def _idem_lookup(self, key, payload_hash):
-        row = self.store.conn.execute(
-            "SELECT payload_hash, response FROM idempotency "
-            "WHERE subject_id=? AND command=? AND request_id=?", key).fetchone()
-        if not row:
-            return None
-        if row["payload_hash"] != payload_hash:
-            raise HiveError("IDEMPOTENCY_CONFLICT",
-                            "相同request-id但参数不同",
-                            {"request_id": key[2]})
-        if row["response"] is None:
-            # previous attempt did not commit; treat as new
-            return ({}, False)
-        return json.loads(row["response"]), True
+    def _idem_reserve_or_replay(self, key, payload_hash):
+        """Reserve the idempotency key BEFORE executing (INSERT wins the race).
+        Returns the cached response dict for a replay, or None when this
+        request owns the execution. Concurrent losers wait for the winner."""
+        import time as _time
+        for _attempt in range(40):
+            with self.store.write() as cur:
+                cur.execute(
+                    "INSERT OR IGNORE INTO idempotency(subject_id,command,"
+                    "request_id,payload_hash,response,created_at) "
+                    "VALUES (?,?,?,?,NULL,?)",
+                    (key[0], key[1], key[2], payload_hash,
+                     format_rfc3339(now_utc())))
+                reserved = cur.execute("SELECT changes()").fetchone()[0] == 1
+                row = cur.execute(
+                    "SELECT payload_hash, response FROM idempotency "
+                    "WHERE subject_id=? AND command=? AND request_id=?",
+                    key).fetchone()
+            if row["payload_hash"] != payload_hash:
+                raise HiveError("IDEMPOTENCY_CONFLICT",
+                                "相同request-id但参数不同",
+                                {"request_id": key[2]})
+            if row["response"] is not None:
+                return json.loads(row["response"])
+            if reserved:
+                return None  # we own the execution; backfill after handler
+            _time.sleep(0.25)  # another same-key request is mid-flight
+        raise HiveError("STORAGE_UNAVAILABLE",
+                        "同request-id请求仍在执行中，请稍后用相同request-id重试",
+                        {"retryable": True})
 
     def _idem_store(self, key, payload_hash, result):
         with self.store.write() as cur:
             cur.execute(
-                "INSERT INTO idempotency(subject_id,command,request_id,payload_hash,"
-                "response,created_at) VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(subject_id,command,request_id) DO NOTHING",
-                (key[0], key[1], key[2], payload_hash,
-                 json.dumps(result, ensure_ascii=False),
-                 format_rfc3339(now_utc())))
+                "UPDATE idempotency SET response=?, payload_hash=? WHERE "
+                "subject_id=? AND command=? AND request_id=?",
+                (json.dumps(result, ensure_ascii=False), payload_hash, *key))
 
     def status(self) -> dict:
         pending = self.store.conn.execute(
