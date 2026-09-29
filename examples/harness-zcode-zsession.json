@@ -1,0 +1,14 @@
+{
+  "name": "zcode-zsession",
+  "adapter": "zsession",
+  "endpoint": "http://127.0.0.1:8765",
+  "send_mode": "adapter-defined",
+  "stop_mode": "adapter",
+  "default_model": "bigmodel-api/GLM-5.3",
+  "capabilities": {"start": true, "send": true, "yolo": true,
+                   "model_at_start": true, "stop": true},
+  "optional_capabilities": {"model_hot": true, "events": true,
+                            "inspect": true, "interrupt": true},
+  "options": {"token_env": "HIVE_ZSESSION_TOKEN"},
+  "metadata": {"note": "真实harness：本机zsession(ZCode会话编排)服务；凭据运行时读取~/.zcode/zsession/config.json的owner-local token，不落入任何spec/日志"}
+}

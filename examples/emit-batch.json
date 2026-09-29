@@ -1,0 +1,9 @@
+{
+  "operations": [
+    {"op": "new", "ref": "child", "parent": "tsk_PARENT",
+     "task": {"target": "port:work/general", "type": "work", "title": "子任务",
+               "body": "处理", "callback": "self"}},
+    {"op": "wait", "task": "tsk_PARENT", "on": ["$child"], "mode": "all",
+     "wait_for": "30m"}
+  ]
+}

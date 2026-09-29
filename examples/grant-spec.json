@@ -1,0 +1,6 @@
+{
+  "subject": "agent:agt_EXAMPLE",
+  "actions": ["task.read", "task.claim"],
+  "resources": ["port:prt_EXAMPLE"],
+  "delegable": false
+}

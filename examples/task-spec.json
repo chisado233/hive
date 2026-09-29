@@ -1,0 +1,13 @@
+{
+  "type": "work",
+  "target": "port:work/general",
+  "title": "示例任务",
+  "summary": "一句话说明输入与产出",
+  "body": "完成所述工作，提交结果",
+  "data": {},
+  "attachments": [],
+  "urgency": "normal",
+  "callback": "none",
+  "claim_within": "30m",
+  "expires_in": null
+}

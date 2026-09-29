@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "示例工作者",
+  "description": "订阅工作端口并处理任务",
+  "instructions": {"text": "领取任务后认真完成，结果写入工位 Markdown。", "files": []},
+  "runtime": {"harness": "fixture-minimal", "model": null, "yolo": true,
+              "auto_start": true, "restart_on_exit": true, "options": {}},
+  "workspace": {"context_glob": "*.md", "exclude": ["agent.md", "prompt.md"],
+                "context_entries": []},
+  "subscriptions": [],
+  "permissions": [],
+  "limits": {"max_inflight_work": 3},
+  "metadata": {}
+}

@@ -1,0 +1,8 @@
+{
+  "reason": "节点退出并交接",
+  "stop": true,
+  "work": [{"task_id": "tsk_W", "action": "forward", "target": "agent:agt_B",
+            "reason": "接任"}],
+  "personal": [{"task_id": "tsk_N", "action": "trash", "reason": "不再需要"}],
+  "callbacks": {"action": "redirect", "target": "agent:agt_B"}
+}

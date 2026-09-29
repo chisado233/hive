@@ -1,0 +1,34 @@
+{
+  "name": "opencode-run",
+  "adapter": "process",
+  "start_argv": [
+    "opencode",
+    "run",
+    "-m",
+    "{model}",
+    "阅读 STARTUP.md 文件并按其中指示开始工作"
+  ],
+  "send_mode": "argv",
+  "send_argv": [
+    "opencode",
+    "run",
+    "{message}"
+  ],
+  "stop_mode": "process",
+  "default_model": "opencode/mimo-v2.6-flash-free",
+  "capabilities": {
+    "start": true,
+    "send": true,
+    "yolo": true,
+    "model_at_start": true,
+    "stop": true
+  },
+  "optional_capabilities": {
+    "events": false,
+    "inspect": false,
+    "model_hot": false
+  },
+  "metadata": {
+    "note": "真实harness示例：opencode无头模式；每次send为全新会话，连续性由工位文件（STARTUP.md等）承载"
+  }
+}
