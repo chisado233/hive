@@ -59,6 +59,10 @@ def cmd_init(args: dict) -> dict:
         "version": __version__, "listen": listen, "test_mode": test_mode,
         "created_at": format_rfc3339(now_utc()),
     }
+    if args.get("default_harness"):
+        # DESIGN CMD-017: --default-harness 落盘为初始默认 harness（此前
+        # 是死参数——接受但永不生效，RDEF-06发现）
+        sysjson["default_harness"] = args["default_harness"]
     write_system_json(home, sysjson)
     cred_out = args.get("owner_credential_out") or os.path.join(home, "auth",
                                                                 "owner.json")

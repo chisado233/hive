@@ -238,6 +238,12 @@ def run_daemon(home: str, listen: str, test_mode: bool, log_level: str) -> dict:
     logger = HiveLogger(home, log_level)
     store = open_store(home)
     service = Service(store, home=home, test_mode=test_mode, logger=logger)
+    # init-time --default-harness seeds the policy when none was set online
+    _dh = sysjson.get("default_harness")
+    if _dh and not (store.kv_get("policy", {}) or {}).get("default_harness"):
+        pol = service.policy()
+        pol["default_harness"] = _dh
+        store.kv_set("policy", pol)
     # runtime subsystems
     from .harness import Registry
     service.harnesses = Registry(store, home, service)

@@ -306,8 +306,14 @@ def create_agent(svc, subject, args, rid) -> dict:
             "config_revision": revision,
             "personal_target": f"agent:{agent_id}"}
     if args.get("start"):
+        # DESIGN CMD-028: --start 注册后请求启动，失败不回滚已注册身份
         from .runtime_ops import op_start_agent
-        data["start_operation"] = op_start_agent(svc, subject, agent_id, None)
+        try:
+            data["start_operation"] = op_start_agent(svc, subject, agent_id,
+                                                     None)
+        except HiveError as e:
+            data["start_operation"] = {"ok": False, "error": e.to_dict()}
+            data["warnings"] = ["启动失败，Agent身份已保留: " + e.message]
     return data
 
 
@@ -367,8 +373,14 @@ def clone_agent(svc, subject, args, rid) -> dict:
     data = {"new_agent": {"agent_id": agent_id, "name": cfg["name"]},
             "source_agent_id": src["agent_id"], "config_revision": revision}
     if args.get("start"):
+        # DESIGN CMD-028: --start 注册后请求启动，失败不回滚已注册身份
         from .runtime_ops import op_start_agent
-        data["start_operation"] = op_start_agent(svc, subject, agent_id, None)
+        try:
+            data["start_operation"] = op_start_agent(svc, subject, agent_id,
+                                                     None)
+        except HiveError as e:
+            data["start_operation"] = {"ok": False, "error": e.to_dict()}
+            data["warnings"] = ["启动失败，Agent身份已保留: " + e.message]
     return data
 
 

@@ -43,6 +43,15 @@ def create_wait(svc, subject, task_id: str, deps: list[str], mode: str,
     if row["owner_subject"] != subject.subject_id and \
             subject.subject_type not in ("owner", "system"):
         raise HiveError("FORBIDDEN", "只能为当前持有的责任任务登记等待")
+    if claim_id:
+        # DESIGN CMD-006: --claim 是"当前实例领取缓存"，提供时必须是本任
+        # 务上调用者的有效领取凭据（RDEF-06: 无效凭据曾被静默接受）
+        c = svc.store.conn.execute(
+            "SELECT 1 FROM task_claims WHERE claim_id=? AND task_id=? AND "
+            "subject_id=? AND invalidated_at IS NULL",
+            (claim_id, task_id, subject.subject_id)).fetchone()
+        if not c or row["state"] != "claimed":
+            raise HiveError("CLAIM_FENCED", "领取凭据无效或已不属于当前领取")
     if len(deps) < 1 or len(deps) > 100:
         raise HiveError("INVALID_ARGUMENT", "依赖数量须为 1..100")
     if mode not in ("all", "any"):

@@ -161,10 +161,19 @@ def update_port(svc, subject, args, rid) -> dict:
                "visibility": row["visibility"],
                "channel_ids": json.loads(row["channel_ids"])}
     from .agents import _merge
-    new_cfg = current if args.get("replace") else _merge(current, patch)
     if args.get("replace"):
-        new_cfg = _merge({"route": row["route"], "name": row["name"],
-                          "handler": row["handler"]}, patch)
+        # 完整替换可选配置：未给出的可选项回退到端口规范默认值——
+        # 缺键曾使 --replace 必然 INTERNAL_ERROR（RDEF-06发现）
+        new_cfg = _merge({
+            "route": row["route"], "name": row["name"],
+            "handler": row["handler"], "description": "",
+            "accepted_types": ["work", "notice", "message"],
+            "input_schema": {}, "defaults": {
+                "urgency": "normal", "claim_within": None, "expires_in": None},
+            "visibility": "authenticated", "channel_ids": [],
+        }, patch)
+    else:
+        new_cfg = _merge(current, patch)
     validate_port_config(new_cfg)
     revision = row["revision"] + 1
     versions_dir = os.path.join(svc.home, "definitions", "ports", port_id, "versions")
