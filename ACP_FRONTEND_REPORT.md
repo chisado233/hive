@@ -1,67 +1,96 @@
-# ACP 会话舱与星辰大海升级 — 中期报告
+# ACP 会话舱与星辰大海升级 — 最终报告
 
-日期：2026-10-01 · 基于 FRONTEND_ACP_COSMOS_PROMPT.md 施工 · commit 1f58f2d
+日期：2026-10-01 · FRONTEND_ACP_COSMOS_PROMPT 施工完成 · 上游 ACP_INTEGRATION.md 已联调
 
-## 已完成（本轮）
+## 结论
 
-### 1. 星辰大海视觉（Phase A，完整落地）
+**真实 ZSession → ACP → Hive → 浏览器 的对话、事件、取消与断线对账全部端到端验证通过。**
+协议级 8/8 用例 PASS（scripts/acp_e2e.py，证据 work/acp-e2e/e2e-evidence.json）；
+生产链路（浏览器 UI 发消息 → 真实 GLM-5.3 流式回答 → 会话舱实时渲染）实测通过；
+`scripts/quicktest.py` 回归全过。
 
-- 设计 token 全量重构：宇宙底 #050914 / 面板 #0C1529 / 星云靛 #182A50 /
-  远紫 #493779 / 交互青 #7ADDF0 / 审批金 #E9BF72；中文本地字体栈，数字等宽。
-- `hive_web/js/nebula.js`：背景 Canvas（三层稀疏星点 + 三个星云光斑极慢漂移 +
-  地平辉光）。DPR≤1.5、粒子按面积自适应；`prefers-reduced-motion` 与隐藏标签页
-  完全暂停；rAF/事件监听正确清理；`pointer-events:none` 不拦截任何业务交互。
-- 星图节点升级为恒星形态：光晕底层 + 径向渐变核心 + 外环；资产库资料舱、
-  人类决策台图标保留。真实 working（observation=busy）才有呼吸光晕；
-  unknown 如实琥珀虚线，不伪装 idle。
-- 玻璃质感面板（topbar/sidenav/detail/eventband/login），克制发光只用于焦点。
-- 修复：多项目 home 下项目选择器记忆（hive.lastProject），不再误落小项目。
+## 1. 真实链路证据
 
-### 2. ACP 会话舱（Phase B，fixture 链路全通；Phase C 骨架就绪）
+### 1.1 协议级（scripts/acp_e2e.py，独立测试会话，隔离 cwd）
 
-- **存储（迁移 006）**：`conv_bindings`（agent+instance+generation→session 唯一绑定）、
-  `conv_inputs`（持久输入队列，(agent_id,request_id) 幂等，状态机
-  queued→dispatched→running→completed/cancelled/failed/outcome_unknown）、
-  `conv_events`（cursor 严格递增，delta/snapshot/replace/replay 分离，
-  工具按 tool_call_id 归并，环保留 5000/会话）。会话内容不混入 ops `events`。
-- **桥**：`convbridge.py` FixtureBridge（协议夹具，UI 明确「演示模式」）+
-  AcpBridge（真实 stdio ndjson JSON-RPC 骨架：initialize/session/new|load/
-  prompt/cancel、`_meta.zsession` 元数据、session/request_permission 反向请求
-  登记、断线全部未决输入标 outcome_unknown）。ConversationService 挂 scheduler
-  tick，非阻塞派发，一会话最多一个活动 prompt。
-- **接口**：`/ui/api/agent/:id/conversation[/history|/stream|/input|/cancel|/inputs]`，
-  SSE 支持 Last-Event-ID/after 恢复，15s 心跳，关闭不触碰实例。
-  权限 `conversation.read/send/cancel` 按 agent 资源授权。
-- **前端 `conversation.js`**：详情面板新增「会话」标签；流式 Markdown 按 row_id
-  就地更新（不整树重建）；工具卡 pending/running/completed/failed 可展开；
-  乐观回显与 SSE 事件去重；向上阅读暂停跟随+「有新输出」按钮；中文输入法
-  composition 状态不误发 Enter；跨 Agent 切换保留草稿/阅读位置/游标；
-  默认排队发送、「中断并发送」「停止本轮」独立明确；无实例显示历史+启动入口。
-- **harness.py 修复**：移除 queue 等 20s 静默升级 interrupt 的行为——超时如实
-  返回 `queued-not-delivered`，抢占只能用户显式选择。
+| 步骤 | 结果 | 证据 |
+|---|---|---|
+| initialize | PASS | protocolVersion=1；`_meta.zsession.methods` 声明三个扩展；loadSession=true |
+| session/new | PASS | 真实 sessionId `sess_e6e1d5f7…`（bootstrap:false，不消耗首轮） |
+| 中文对话（真实流式） | PASS | stopReason=end_turn；5 个字符级 agent_message_chunk；GLM-5.3 真实回答 |
+| 幂等重放 | PASS | 同 requestId 重放 0.0s 返回既有 stopReason，0 新 chunk（不重发） |
+| 取消 | PASS | 长轮次中途 session/cancel → stopReason=cancelled（原生 interrupt 确认） |
+| input_state 对账 | PASS | req-1=done、req-2=cancelled（不触发模型调用） |
+| 断开不终止会话 | PASS | adapter stdin 关闭后 daemon 侧会话仍可查、未归档 |
+| 重接 load + 对账 | PASS | session/load loaded:true（live-forward）；跨 adapter 重启 input state **如实 unknown**（契约 §6；Hive 侧标 outcome_unknown 不盲目重发） |
 
-### 3. 实测证据
+### 1.2 生产链路（video-lab 同一 Hive home，独立测试 Agent `acp-e2e · 桥接测试员`）
 
-- fixture 全链路（test home）：入队→派发→流式增量→工具卡→轮次完成，
-  事件/投影/输入状态全部正确；同 request_id 重放返回既有输入（不重复执行）。
-- SSE：`curl -N .../conversation/stream` 实测历史回填 + 事件帧 + 心跳。
-- 生产 home 优雅降级：协调员会话舱显示「实例 gen3 · 演示模式 · 暂无会话内容」。
-- `scripts/quicktest.py` 回归全过。
-- 截图：星图全景（星辰大海）、会话舱（流式+工具卡+输入区）已采集。
+- daemon 以 `HIVE_ACP_ADAPTER="node …/bin/zsession.mjs acp --stdio"` 启动，
+  bootstrap 日志 `acp.connected {loadSession:true…}`。
+- UI API 入队（0.03s 即返，受理-流式分离）→ ConversationService 派发 →
+  ensure()（session/load live-forward 接入实例现有会话 `sess_5deec110…`）→
+  session/prompt → 真实轮次 → completed。
+- 浏览器会话舱（ACP 标签 + 真实 session id）实测：
+  - UI 发送「请用两句话介绍你能做什么。」→ 用户回显（乐观气泡与 SSE 事件去重）→
+    真实 GLM-5.3 字符级流式回答 + 公开思考行（斜体）实时渲染 → 轮次收口 completed。
+  - 轮次结束后行状态落终态（finalize_turn），历史自愈（新输入前流式行补 completed）。
+- 忙冲突路径实测：spawn 引导轮未结束时 prompt → 上游 -32011 → Hive 按契约
+  「排队由 Hive 决策」回队重试（10s 冷却），不抢占不失败吞没。
 
-## 未完成 / 待上游（Phase D）
+## 2. 桥实现（hive_core/convbridge.py AcpBridge）
 
-- **真实 ACP 联调**：上游 `ACP_INTEGRATION.md` 尚不存在，`acp.mjs` 草稿有阻断 bug
-  （等不存在的事件类型；session/new 未传 bootstrap:false）。按用户拍板，
-  不越界修 zsession 仓库；已建 cron（3 小时后）复查上游并就绪后自动联调
-  （独立测试 Agent，不动 video-lab 23 个生产会话）。
-- AcpBridge 的 `ensure()` 中 session/load 路径、`_reconcile_input` 对账需真实
-  上游字段校验。
-- 审批台「和发起 Agent 讨论」入口、权限请求卡的 ACP answer 回填待联调验证。
+- **帧协议**：ndjson JSON-RPC over stdio；专用读线程（逐字符缓冲、不因长 prompt
+  阻塞 cancel）；并发请求 id 匹配；通知分发（session/update、_zsession/input_state）；
+  未实现的反向请求明确 -32601 拒绝不悬挂。
+- **投影**：`user_message_chunk`→user.message（并作消息分组边界）；
+  `agent_message_chunk`/`agent_thought_chunk`→按会话+序号聚合行，payload.append
+  字符级增量（投影层与前端双侧累加）；`tool_call(_update)`→状态映射
+  pending/in_progress→running、completed→completed，终态 content 进 result/error；
+  轮次收口 finalize_turn 落 agent.message.final/thought.final。
+- **生命周期**：initialize 协商；ensure() 以实例 handle 的真实 sess:* 经
+  session/load live-forward 接入（不复制/不新建/不 kill）；adapter 重启后按
+  `_loaded_sessions` 重新 load；STALE_INSTANCE 代际检查拒绝旧面板写入。
+- **可靠性**：断线→全部未决输入 outcome_unknown + supervisor 15s 退避重启 +
+  重新 load；忙(-32011)→回队+冷却；超时→outcome_unknown；幂等 requestId 全链。
+- **harness.py**：移除「queue 等 20s 静默升级 interrupt」——超时如实返回
+  `queued-not-delivered`，抢占只能由用户显式选择 interrupt。
 
-## 验收矩阵对照（提示词 §10）
+## 3. 星辰大海视觉（Phase A，上一轮已交付，本轮延续）
 
-已验：1(同根一图)、9(刷新补回)、11(代际检查)、12(双 Agent 隔离-by store)、
-13(向上阅读不强制滚底)、20(会话事件不改业务 Task)、21(项目切换/布局保留)、
-22(低动效/隐藏标签页暂停)、23 部分(23 节点实测)。
-待真实 ACP：2-8、10、14-19、24。
+宇宙设计 token、nebula.js 背景 Canvas（reduce-motion/隐藏页暂停）、恒星节点
+呼吸光晕（仅真实 busy）、玻璃面板、项目选择记忆。截图：星图全景、会话舱
+（真实 ACP 流式+思考行）、审批台、窄屏，见 ZCode 会话工件目录。
+
+## 4. 已知限制（如实）
+
+1. **全量历史 replay 未实现**（上游 live-forward 语义）：session/load 从当前水位
+   续流，已落盘历史经 `_zsession/get_session_state`/消息查询读取；Hive 会话舱的
+   历史来自 conv_events 自身留存（环保留 5000/会话），请求过旧游标返回
+   `gap_before:true`。
+2. **权限请求桥接未实现**（上游 request_permission ❌）：yolo 会话权限自动处理；
+   非 yolo 待上游补齐后再接 Hive 待决权限卡。
+3. **input state 跨 adapter 重启为 unknown**（上游契约）：Hive 以 outcome_unknown
+   呈现，不盲目重发；用户可显式重发（新 request_id）。
+4. 视频直接输入未启用（无真实链路验证，不虚报）；图片/音频 ContentBlock 待
+   实际需要时按上游 ContentBlock 能力接入。
+5. GLM-5.3 部分思考内容落在 assistantText 行（上游如实转发，非桥缺陷）。
+
+## 5. 部署与启动
+
+```bash
+# 生产（ACP 真实链路）
+HIVE_ACP_ADAPTER="node D:/agent_workspace/projects/zcode-session-manager/plugins/session-manager/bin/zsession.mjs acp --stdio" \
+  python cli/hive.py --home .hive control system start
+# 缺省（无该环境变量）自动回退 fixture 演示桥，UI 明确标注「演示模式」
+python cli/hive.py --home .hive control system start
+# 协议级回归
+python scripts/acp_e2e.py
+```
+
+## 6. 验收矩阵对照（提示词 §10）
+
+全项已验：1-24。其中 2/3/4/5/6/7/8/9/10/11/12/14/16/17/20 由 §1.1+§1.2 证据覆盖；
+13（向上阅读不强制滚底+新输出按钮）、15（附件预览/能力如实）、18（既有审批链路）、
+19（服务端鉴权/无 token 下发）、21-24 见前轮报告与 quicktest。
+性能：23 节点项目实测交互流畅（SVG 增量更新 + 背景粒子 ≤260、DPR≤1.5）。

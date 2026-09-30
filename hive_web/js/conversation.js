@@ -276,8 +276,8 @@ export class ConversationPane {
     const url = `/ui/api/agent/${this.agentId}/conversation/stream?after=${this.cache.cursor || 0}`;
     this.es = new EventSource(url);
     const kinds = ["user.message", "agent.delta", "agent.message.final",
-      "tool.call", "turn.started", "turn.completed", "turn.failed",
-      "turn.cancelled", "permission.request", "system.note"];
+      "agent.thought", "tool.call", "turn.started", "turn.completed",
+      "turn.failed", "turn.cancelled", "permission.request", "system.note"];
     for (const k of kinds) {
       this.es.addEventListener(k, (e) => {
         if (this.destroyed) return;
@@ -302,9 +302,22 @@ export class ConversationPane {
       if (localDup) { localDup.remove(); }
       this._appendMessage({ kind: "user", id: ev.event_id, text: p.text,
         state: "completed", at: ev.recorded_at });
-    } else if (t === "agent.delta" || t === "agent.message.final") {
-      this._appendMessage({ kind: "assistant", id: ev.row_id || ev.event_id,
-        text: p.text, state: p.state, at: ev.recorded_at, replay: ev.replay });
+    } else if (t === "agent.delta" || t === "agent.thought" ||
+               t === "agent.message.final") {
+      // ACP 链路 chunk 为字符级 append（无 rowId 上游帧由桥聚合成行）；
+      // fixture 链路 payload.text 为累积全文。两种语义统一在此归并。
+      this._rowAcc = this._rowAcc || new Map();
+      const rid = ev.row_id || ev.event_id;
+      let acc = this._rowAcc.get(rid);
+      if (p.append) acc = (acc || "") + p.append;
+      else acc = p.text != null ? p.text : (acc || "");
+      this._rowAcc.set(rid, acc);
+      const finalState = t === "agent.message.final" ? "completed" : null;
+      this._appendMessage({
+        kind: t === "agent.thought" ? "thought" : "assistant",
+        id: rid, text: acc,
+        state: finalState || p.state || "streaming",
+        at: ev.recorded_at, replay: ev.replay });
     } else if (t === "tool.call") {
       this._appendMessage({ kind: "tool", id: ev.tool_call_id || ev.event_id,
         tool: p.tool, title: p.title, state: p.state, args: p.args,

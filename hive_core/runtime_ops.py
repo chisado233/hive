@@ -342,9 +342,15 @@ def op_send_agent(svc, subject, agent_id: str, args, rid) -> dict:
         harness = cfg.get("runtime", {}).get("harness")
         caps = svc.harnesses.get_spec(harness).get("capabilities", {}) \
             if harness else {}
+        # D-05 fix: interrupt may be declared in optional_capabilities
+        # (zcode-zsession declares it there) — honor both places.
+        opt_caps = (svc.harnesses.get_spec(harness).get(
+            "optional_capabilities", {}) if harness else {})
         # unified native-interrupt key: steer OR interrupt (zsession declares
         # interrupt:true) — a declared capability must actually be used
-        native_interrupt = bool(caps.get("steer") or caps.get("interrupt"))
+        native_interrupt = bool(caps.get("steer") or caps.get("interrupt")
+                                or opt_caps.get("steer")
+                                or opt_caps.get("interrupt"))
         # fixture: model_hot/steer not native -> no interrupt unless restart
         fixture_hot = False
         if harness and svc.harnesses.get_spec(harness).get("adapter") == "fixture":

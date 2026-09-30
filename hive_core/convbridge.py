@@ -120,6 +120,10 @@ class AcpBridge:
         self._lock = threading.Lock()
         self.capabilities: dict = {}
         self.last_error: str | None = None
+        # adapter 进程内已 track 的会话（断线重启后必须重新 session/load）
+        self._loaded_sessions: set[str] = set()
+        # 会话内消息分组计数（上游 chunk 无 rowId，按会话+序号聚合）
+        self._msg_seq: dict[str, int] = {}
 
     # ---------------- lifecycle ----------------
     def start(self):
@@ -127,9 +131,10 @@ class AcpBridge:
         import sys as _sys
         if self.proc and self.proc.poll() is None:
             return
-        from .harness import _resolve_exe
+        import shutil
         argv = list(self.argv)
-        argv[0] = _resolve_exe(argv[0]) or argv[0]
+        if argv and not os.path.isabs(argv[0]):
+            argv[0] = shutil.which(argv[0]) or argv[0]
         errlog = open(
             os.path.join(self.svc.home, "logs", "acp-adapter.log"),
             "a", encoding="utf-8")
@@ -216,6 +221,7 @@ class AcpBridge:
             return
         self._alive.clear()
         self.last_error = "ACP 桥接断开"
+        self._loaded_sessions.clear()      # adapter 进程将退出/已退出
         # 所有未决 RPC 失败
         for q in list(self._pending.values()):
             q.put({"error": {"code": -32000, "message": "bridge disconnected"}})
@@ -283,40 +289,87 @@ class AcpBridge:
                 ensure_ascii=False))
 
     def _project_update(self, p: dict):
+        """上游 session/update 投影。上游帧（见 ACP_INTEGRATION.md §4）：
+        {sessionId, update:{sessionUpdate, content?|toolCallId?|title?|status?}}
+        chunk 无 rowId 且为字符级 append —— 按会话+序号聚合消息行，
+        payload.append 由投影层与前端累加。"""
         sid = p.get("sessionId")
         upd = p.get("update") or {}
         kind = upd.get("sessionUpdate")
         meta = (p.get("_meta") or {}).get("zsession") or {}
         agent_id = meta.get("agentId")
-        binding_agent = agent_id
-        if not binding_agent:
+        if not agent_id:
             b = self.svc.store.conn.execute(
                 "SELECT * FROM conv_bindings WHERE session_id=?",
                 (sid,)).fetchone()
-            binding_agent = b["agent_id"] if b else None
-        base = {"session_id": sid, "source": "acp", "agent_id": binding_agent,
-                "upstream_seq": (p.get("_meta") or {}).get("zsession", {}).get("seq")}
-        if kind == "agent_message_chunk":
-            content = upd.get("content") or {}
-            text = content.get("text", "")
-            row = upd.get("rowId") or meta.get("rowId") or "cur"
+            agent_id = b["agent_id"] if b else None
+        base = {"session_id": sid, "source": "acp", "agent_id": agent_id,
+                "upstream_seq": meta.get("seq")}
+        if kind == "user_message_chunk":
+            # 新一轮用户输入：递增消息分组
+            n = self._msg_seq.get(sid, 0) + 1
+            self._msg_seq[sid] = n
+            conv.add_conv_event(
+                self.svc, type="user.message", row_id=f"msg-{sid}-{n}",
+                payload={"text": (upd.get("content") or {}).get("text", ""),
+                         "source": "user"}, **base)
+        elif kind == "agent_message_chunk":
+            row = self._current_row(sid, "msg")
             conv.add_conv_event(
                 self.svc, type="agent.delta", row_id=row,
-                payload={"text": text, "state": "streaming", "append": True},
-                dedupe_key=None, **base)
-        elif kind == "tool_call":
+                payload={"append": (upd.get("content") or {}).get("text", ""),
+                         "state": "streaming"}, **base)
+        elif kind == "agent_thought_chunk":
+            row = self._current_row(sid, "thd")
+            conv.add_conv_event(
+                self.svc, type="agent.thought", row_id=row,
+                payload={"append": (upd.get("content") or {}).get("text", ""),
+                         "state": "streaming"}, **base)
+        elif kind in ("tool_call", "tool_call_update"):
+            title = upd.get("title") or "tool"
+            tool = title.split(":", 1)[0].strip() or "tool"
+            status = upd.get("status") or "running"
+            state = {"pending": "running", "in_progress": "running",
+                     "completed": "completed"}.get(status, "running")
+            payload = {"tool": tool, "title": title, "state": state}
+            for c in (upd.get("content") or []):
+                txt = (c or {}).get("text") or ""
+                if not txt:
+                    continue
+                # 上游仅在 success/error 终态附 content：输出/错误摘要
+                payload.setdefault("result" if status == "completed"
+                                   else "error", txt)
             conv.add_conv_event(
                 self.svc, type="tool.call",
-                tool_call_id=upd.get("toolCallId"),
-                payload={"tool": upd.get("title"), "state": "running",
-                         "args": upd.get("rawInput")}, **base)
-        elif kind == "tool_call_update":
-            conv.add_conv_event(
-                self.svc, type="tool.call",
-                tool_call_id=upd.get("toolCallId"),
-                payload={"tool": upd.get("title"), "state":
-                         (upd.get("status") or "running"),
-                         "result": upd.get("rawOutput")}, **base)
+                tool_call_id=upd.get("toolCallId") or title,
+                payload=payload, **base)
+
+    def _current_row(self, sid: str, prefix: str) -> str:
+        key = f"_row_{prefix}_{sid}"
+        row = getattr(self, key, None)
+        if not row:
+            n = self._msg_seq.get(sid, 0) + 1
+            self._msg_seq[sid] = n
+            row = f"{prefix}-{sid}-{n}"
+            setattr(self, key, row)
+        return row
+
+    def finalize_turn(self, sid: str, state: str = "completed"):
+        """轮次收口：当前消息/思考行落终态，行分组重置（下一轮起新行）。"""
+        b = self.svc.store.conn.execute(
+            "SELECT * FROM conv_bindings WHERE session_id=?", (sid,)).fetchone()
+        agent_id = b["agent_id"] if b else None
+        for prefix in ("msg", "thd"):
+            key = f"_row_{prefix}_{sid}"
+            row = getattr(self, key, None)
+            if row:
+                conv.add_conv_event(
+                    self.svc, session_id=sid,
+                    type="agent.message.final" if prefix == "msg"
+                    else "thought.final",
+                    source="acp", agent_id=agent_id, row_id=row,
+                    payload={"state": state})
+                delattr(self, key)
 
     def _reconcile_input(self, p: dict):
         rid = p.get("requestId")
@@ -328,7 +381,7 @@ class AcpBridge:
             return
         state = p.get("state")
         mapping = {"accepted": "dispatched", "started": "running",
-                   "completed": "completed", "cancelled": "cancelled",
+                   "done": "completed", "cancelled": "cancelled",
                    "rejected": "failed", "unknown": "outcome_unknown"}
         if state in mapping:
             conv.set_input_state(self.svc, row["input_id"], mapping[state],
@@ -336,11 +389,22 @@ class AcpBridge:
                                  turn_id=p.get("turnId"))
 
     # ---------------- bridge contract ----------------
+    def _execution_root(self, agent_id: str) -> str:
+        try:
+            from .agents import get_agent_config
+            cfg = get_agent_config(self.svc, agent_id)
+            return ((cfg.get("runtime") or {}).get("options") or {}).get(
+                "execution_root") or self.svc.home
+        except HiveError:
+            return self.svc.home
+
     def ensure(self, agent_id: str, inst) -> dict:
         existing = conv.get_binding(self.svc, agent_id)
-        if existing and existing["instance_id"] == inst["instance_id"]:
+        if existing and existing["instance_id"] == inst["instance_id"] \
+                and existing["session_id"] in self._loaded_sessions:
             return existing
-        # 增强模式：实例的 zsession 句柄即真实会话；按能力接入
+        # 实例的 zsession 句柄即真实会话；session/load live-forward 接入
+        # （不复制、不新建；adapter 重启后重新 load）
         handle = inst["handle"] or ""
         sid = handle.split(":", 1)[1] if handle.startswith("sess:") else None
         if not sid:
@@ -348,14 +412,21 @@ class AcpBridge:
                             "该实例没有可接入的 ZSession 会话句柄",
                             {"handle": handle})
         if self.capabilities.get("loadSession"):
-            try:
-                self.call("session/load", {"sessionId": sid, "cwd": ""})
-            except HiveError:
-                # 不可安全接入：保持只读绑定，历史由 zsession 自持
-                pass
+            res = self.call("session/load", {
+                "sessionId": sid, "cwd": self._execution_root(agent_id)})
+            if not res.get("loaded", True):
+                reason = ((res.get("_meta") or {}).get("zsession") or {}).get(
+                    "reason") or "unknown"
+                raise HiveError("UPSTREAM_UNSUPPORTED",
+                                f"会话不可安全接入: {reason}",
+                                {"session_id": sid})
+        else:
+            raise HiveError("UPSTREAM_UNSUPPORTED",
+                            "上游未声明 loadSession 能力")
+        self._loaded_sessions.add(sid)
         return conv.bind_session(self.svc, agent_id, inst["instance_id"],
                                  inst["generation"], sid,
-                                 project_root=None,
+                                 project_root=self._execution_root(agent_id),
                                  connection_state="connected", source="acp")
 
     def send_prompt(self, binding: dict, inp) -> dict:
@@ -364,13 +435,16 @@ class AcpBridge:
             "agentId": inp["agent_id"], "instanceId": inp["instance_id"],
             "generation": inp["generation"], "source": "hive-console"}}
         blocks = [{"type": "text", "text": inp["text"]}]
+        # 阻塞至真实轮次结束（上游以 stopReason 收口；忙时 -32011 冲突）
         return self.call("session/prompt", {
             "sessionId": binding["session_id"], "prompt": blocks,
-            "_meta": meta}, timeout=24 * 3600)   # 轮次由后台管理，不设短超时
+            "_meta": meta}, timeout=24 * 3600)
 
     def cancel_turn(self, binding: dict, turn_id: str | None = None):
-        self._notify("session/cancel", {"sessionId": binding["session_id"],
-                                        "_meta": {"zsession": {"turnId": turn_id}}})
+        # session/cancel 是请求：确认送达上游；轮次取消以 prompt 返回
+        # stopReason=cancelled / input_state 通知为准
+        self.call("session/cancel", {"sessionId": binding["session_id"],
+                                     "_meta": {"zsession": {"turnId": turn_id}}})
         return {"cancel_requested": True}
 
 
@@ -387,14 +461,20 @@ class ConversationService:
         self.bridge = bridge
         self._working: set[str] = set()   # agent_id 正在桥线程上派发
         self._threads: list[threading.Thread] = []
+        self._bridge_next_try = 0.0
+        self._cooldown: dict[str, float] = {}   # agent_id → 重试不早于该时刻
 
     def tick(self):
+        self._supervise_bridge()
         rows = self.svc.store.conn.execute(
             "SELECT DISTINCT agent_id FROM conv_inputs WHERE state='queued'"
         ).fetchall()
         for r in rows:
             agent_id = r["agent_id"]
             if agent_id in self._working:
+                continue
+            import time as _t
+            if self._cooldown.get(agent_id, 0) > _t.monotonic():
                 continue
             if conv.active_input(self.svc, agent_id):
                 continue                       # 一次只跑一个 prompt
@@ -408,6 +488,22 @@ class ConversationService:
             t.start()
             self._threads.append(t)
 
+    def _supervise_bridge(self):
+        """ACP 桥断线重启监督（15s 退避）。fixture 桥无进程，直接跳过。"""
+        if not hasattr(self.bridge, "_alive"):
+            return
+        if self.bridge._alive.is_set():
+            return
+        import time as _t
+        if _t.monotonic() < self._bridge_next_try:
+            return
+        self._bridge_next_try = _t.monotonic() + 15
+        try:
+            self.bridge.start()
+            self.svc.logger.info("acp.reconnected")
+        except Exception as e:  # noqa: BLE001
+            self.svc.logger.error("acp.restart_failed", error=repr(e))
+
     def _dispatch_one(self, agent_id: str, inst: dict):
         try:
             inp = conv.next_queued(self.svc, agent_id)
@@ -420,24 +516,57 @@ class ConversationService:
             conv.set_input_state(self.svc, inp["input_id"], "dispatched",
                                  session_id=binding["session_id"])
             receipt = self.bridge.send_prompt(binding, inp)
-            conv.set_input_state(self.svc, inp["input_id"], "completed",
-                                 upstream_input_id=(receipt or {}).get("inputId"),
-                                 turn_id=(receipt or {}).get("turn_id"))
+            stop = (receipt or {}).get("stopReason") or "end_turn"
+            fin = "cancelled" if stop == "cancelled" else "completed"
+            if hasattr(self.bridge, "finalize_turn"):
+                self.bridge.finalize_turn(binding["session_id"], fin)
+            if stop == "cancelled":
+                conv.set_input_state(self.svc, inp["input_id"], "cancelled",
+                                     upstream_input_id=(receipt or {}).get("inputId"))
+            else:
+                conv.set_input_state(self.svc, inp["input_id"], "completed",
+                                     upstream_input_id=(receipt or {}).get("inputId"),
+                                     turn_id=(receipt or {}).get("turn_id"))
+        except HiveError as e:
+            self._fail_input(agent_id, e)
+            self.svc.logger.error("conv.dispatch_failed", agent=agent_id,
+                                  error=repr(e))
         except Exception as e:  # noqa: BLE001 - 持久化失败原因，绝不静默
-            try:
-                inp = conv.next_queued(self.svc, agent_id)
-                if inp is None:
-                    # 输入可能已被推进到 dispatched——按当前活动行标记
-                    inp = conv.active_input(self.svc, agent_id)
-                if inp is not None and inp["state"] in ("queued", "dispatched"):
-                    conv.set_input_state(self.svc, inp["input_id"], "failed",
-                                         error=repr(e)[:500])
-            except Exception:  # noqa: BLE001
-                pass
+            self._fail_input(agent_id, e)
             self.svc.logger.error("conv.dispatch_failed", agent=agent_id,
                                   error=repr(e))
         finally:
             self._working.discard(agent_id)
+
+    def _fail_input(self, agent_id: str, e):
+        """失败落账：忙冲突=回队重试（排队由 Hive 决策）；超时/断线=结果未知
+        （不盲目重放）；其余=failed。"""
+        upstream_code = ((getattr(e, "details", {}) or {}).get("upstream") or {}) \
+            .get("code")
+        if upstream_code == -32011:
+            # managed-write conflict：会话忙。输入回 queued 稍后重发
+            # （上游尚未登记该 requestId，重发安全）；10s 冷却防热循环。
+            inp = conv.next_queued(self.svc, agent_id)
+            if inp is None:
+                inp = conv.active_input(self.svc, agent_id)
+            if inp is not None and inp["state"] in ("queued", "dispatched"):
+                conv.set_input_state(self.svc, inp["input_id"], "queued")
+            import time as _t
+            self._cooldown[agent_id] = _t.monotonic() + 10
+            self.svc.logger.warning("conv.busy_requeued", agent=agent_id)
+            return
+        inp = conv.next_queued(self.svc, agent_id)
+        if inp is None:
+            inp = conv.active_input(self.svc, agent_id)
+        if inp is None or inp["state"] not in ("queued", "dispatched"):
+            return
+        state = "outcome_unknown" if e.code in ("UPSTREAM_TIMEOUT",
+                                                "UPSTREAM_ERROR") else "failed"
+        try:
+            conv.set_input_state(self.svc, inp["input_id"], state,
+                                 error=f"{e.code}: {e.message}"[:500])
+        except Exception:  # noqa: BLE001
+            pass
 
     def stop(self):
         self.bridge.close()

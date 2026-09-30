@@ -40,6 +40,13 @@ def create_receipt(svc, cur, *, source_row, terminal_event_id: str, state: str,
                         kind="task.created", actor="system:callback",
                         payload={"target": target, "type": "receipt",
                                  "source_task": source_row["task_id"]})
+    # D-04 fix: receipts must wake their target too — notification-driven
+    # agents sleep between turns; without a wake the callback receipt sits
+    # queued forever. Per-receipt dedupe key is unique (never swallowed by
+    # an already-consumed personal:<agent> key).
+    from .scheduler import notify_new_task
+    notify_new_task(svc, cur, receipt_id, target, "receipt",
+                    dedupe_prefix=f"receipt:{receipt_id}")
     kind = "receipt"
     if target.startswith("port:"):
         prow = cur.execute("SELECT * FROM ports WHERE port_id=?",

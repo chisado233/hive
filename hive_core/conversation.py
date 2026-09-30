@@ -298,10 +298,20 @@ def project_messages(svc, session_id: str, limit: int = 400) -> dict:
                              "at": ev["recorded_at"],
                              "source": p.get("source", "user"),
                              "state": p.get("state", "completed")})
+            # 自愈：新用户输入意味着此前的流式行必然已结束（历史自愈）
+            for m in messages:
+                if m["kind"] in ("assistant", "thought") and \
+                        m.get("state") == "streaming":
+                    m["state"] = "completed"
         elif t in ("agent.delta", "agent.message", "agent.thought"):
             if rid and rid in by_row and t == "agent.delta":
                 m = by_row[rid]
-                m["text"] = p.get("text", m["text"])
+                if p.get("append"):
+                    # 字符级增量（ACP 链路）：按行累加
+                    m["_acc"] = m.get("_acc", "") + p["append"]
+                    m["text"] = m["_acc"]
+                else:
+                    m["text"] = p.get("text", m["text"])
                 m["state"] = p.get("state", "streaming")
                 m["at"] = ev["recorded_at"]
             else:
@@ -310,12 +320,19 @@ def project_messages(svc, session_id: str, limit: int = 400) -> dict:
                      "state": p.get("state", "streaming"),
                      "at": ev["recorded_at"],
                      "replay": ev["replay"]}
+                if p.get("append"):
+                    m["_acc"] = p["append"]
+                    m["text"] = p["append"]
                 messages.append(m)
                 if rid:
                     by_row[rid] = m
         elif t == "agent.message.final" and rid and rid in by_row:
             by_row[rid]["state"] = "completed"
-            by_row[rid]["text"] = p.get("text", by_row[rid]["text"])
+            if p.get("text"):
+                by_row[rid]["text"] = p["text"]
+                by_row[rid]["_acc"] = p["text"]
+        elif t == "thought.final" and rid and rid in by_row:
+            by_row[rid]["state"] = p.get("state", "completed")
         elif t == "tool.call":
             tcid = ev.get("tool_call_id") or rid or ev["event_id"]
             if tcid in by_row:

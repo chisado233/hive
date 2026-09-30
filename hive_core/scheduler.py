@@ -386,7 +386,8 @@ class Scheduler:
                 "NOT IN (SELECT task_id FROM tasks WHERE state='queued')")
         stuck = svc.store.conn.execute(
             "SELECT t.task_id, t.target, t.type, t.spec_version FROM tasks t "
-            "WHERE t.state='queued' AND t.type IN ('work','notice','message') "
+            "WHERE t.state='queued' AND t.type IN "
+            "('work','notice','message','receipt') "
             "AND t.created_at<=? LIMIT 50", (cutoff,)).fetchall()
         for t in stuck:
             task_row = svc.store.conn.execute(

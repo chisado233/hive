@@ -234,6 +234,20 @@ def make_handler(service: Service):
     return Handler
 
 
+def _acp_bootstrap(conversation, logger):
+    def run():
+        import time as _t
+        _t.sleep(1.0)
+        try:
+            conversation.bridge.start()
+            logger.info("acp.connected",
+                        capabilities=json.dumps(
+                            conversation.bridge.capabilities))
+        except Exception as e:  # noqa: BLE001
+            logger.error("acp.bootstrap_failed", error=repr(e))
+    return run
+
+
 def run_daemon(home: str, listen: str, test_mode: bool, log_level: str) -> dict:
     sysjson = read_system_json(home)
     if not sysjson.get("initialized"):
@@ -259,8 +273,21 @@ def run_daemon(home: str, listen: str, test_mode: bool, log_level: str) -> dict:
     # runtime subsystems
     from .harness import Registry
     service.harnesses = Registry(store, home, service)
-    from .convbridge import ConversationService, FixtureBridge
-    service.conversation = ConversationService(service, FixtureBridge(service))
+    import os as _os
+    from .convbridge import ConversationService
+    _acp_argv = _os.environ.get("HIVE_ACP_ADAPTER")
+    if _acp_argv:
+        from .convbridge import AcpBridge
+        service.conversation = ConversationService(service, AcpBridge(
+            service, _acp_argv.split()))
+        logger.info("conversation.bridge", bridge="acp", argv=_acp_argv)
+        # spawn adapter + initialize 在后台线程完成；断线由 supervisor 重启
+        threading.Thread(target=_acp_bootstrap(service.conversation, logger),
+                         name="acp-bootstrap", daemon=True).start()
+    else:
+        from .convbridge import FixtureBridge
+        service.conversation = ConversationService(service,
+                                                   FixtureBridge(service))
     from .scheduler import Scheduler
     service.scheduler = Scheduler(service)
     httpd = ThreadingHTTPServer(("127.0.0.1", int(listen.split(":")[1])),
