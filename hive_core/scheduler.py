@@ -11,30 +11,29 @@ from .ids import new_id
 from .timeutil import format_rfc3339, parse_rfc3339
 
 
-def notify_new_task(svc, cur, task_id: str, target: str, task_type: str,
-                    dedupe_prefix: str | None = None):
-    """Queue candidate notifications inside the creation transaction."""
+def _task_candidates(cur, svc, task_id: str, target: str,
+                     task_type: str) -> list[str]:
+    """Candidate agent ids for waking about task_id, honoring the same
+    gates as the first notify: enabled lifecycle+subscription (ports),
+    work-capacity, decline suppression on the current spec_version.
+    Shared by notify_new_task and reconcile rounds (RDEF-04/05)."""
     if not target.startswith("port:"):
-        # personal target: wake the agent if enabled+auto_start (no instances)
-        agent_id = target[6:]
+        agent_id = target[6:] if target.startswith("agent:") else target
         row = cur.execute("SELECT lifecycle FROM agents WHERE agent_id=?",
                           (agent_id,)).fetchone()
-        if row and row["lifecycle"] == "enabled":
-            _queue_notif(cur, agent_id,
-                         dedupe_prefix or f"personal:{agent_id}",
-                         "新的个人投递待处理", svc)
-        return
+        return [agent_id] if row and row["lifecycle"] == "enabled" else []
     port_id = target[5:]
-    prow = cur.execute("SELECT * FROM ports WHERE port_id=?", (port_id,)).fetchone()
-    if not prow or prow["handler"] != "agents":
-        return
+    prow = cur.execute("SELECT * FROM ports WHERE port_id=?",
+                       (port_id,)).fetchone()
+    if not prow or prow["handler"] != "agents" or prow["state"] != "enabled":
+        return []
     candidates = cur.execute(
         "SELECT s.agent_id FROM subscriptions s JOIN agents a ON "
         "a.agent_id=s.agent_id WHERE s.port_id=? AND s.enabled=1 AND "
         "a.lifecycle='enabled'", (port_id,)).fetchall()
+    out = []
     for c in candidates:
         agent_id = c["agent_id"]
-        # work capacity gate for notification candidacy
         if task_type == "work":
             inflight = cur.execute(
                 "SELECT COUNT(*) c FROM tasks WHERE owner_subject=? AND "
@@ -53,16 +52,28 @@ def notify_new_task(svc, cur, task_id: str, target: str, task_type: str,
                     pass
             if inflight >= cfg_limit:
                 continue
-        # decline suppression on current spec_version
         sv = cur.execute("SELECT spec_version FROM tasks WHERE task_id=?",
-                         (task_id,)).fetchone()["spec_version"]
+                         (task_id,)).fetchone()
+        sv = sv["spec_version"] if sv else None
         declined = cur.execute(
             "SELECT 1 FROM task_declines WHERE task_id=? AND subject_id=? AND "
             "spec_version=?", (task_id, agent_id, sv)).fetchone()
         if declined:
             continue
-        _queue_notif(cur, agent_id, dedupe_prefix or f"port:{port_id}",
-                     "端口有新任务待领取", svc)
+        out.append(agent_id)
+    return out
+
+
+def notify_new_task(svc, cur, task_id: str, target: str, task_type: str,
+                    dedupe_prefix: str | None = None):
+    """Queue candidate notifications inside the creation transaction."""
+    for agent_id in _task_candidates(cur, svc, task_id, target, task_type):
+        _queue_notif(cur, agent_id,
+                     dedupe_prefix or (f"port:{target[5:]}"
+                                       if target.startswith("port:")
+                                       else f"personal:{agent_id}"),
+                     "端口有新任务待领取" if target.startswith("port:")
+                     else "新的个人投递待处理", svc)
 
 
 
@@ -130,10 +141,104 @@ class Scheduler:
         self.run_deadline_scan()
         self.run_notifications()
         self.run_due_restarts()
+        self.run_grace_stops()
         self.run_reconcile_wakes()
         self.run_cold_start()
         self.run_outbox()
         self.run_triggers()
+
+    def run_grace_stops(self):
+        """RDEF-09: terminate instances whose accepted grace window has
+        elapsed (hint already sent at acceptance). Persistent kv plans
+        survive daemon restarts; termination revokes credentials (fencing)
+        and honors then_start (graceful restart replacement)."""
+        import json as _json
+        svc = self.svc
+        now = svc.now()
+        rows = svc.store.conn.execute(
+            "SELECT k, v FROM kv WHERE k LIKE 'gracestop:%'").fetchall()
+        for r in rows:
+            try:
+                st = _json.loads(r["v"])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(st, dict):
+                continue
+            if st.get("deadline") and st["deadline"] > now:
+                continue
+            op_id = st.get("op_id")
+            agent_id = st.get("agent_id")
+            inst = svc.store.conn.execute(
+                "SELECT * FROM instances WHERE instance_id=?",
+                (st.get("instance_id"),)).fetchone()
+            with svc.store.write() as cur:
+                cur.execute("DELETE FROM kv WHERE k=?", (r["k"],))
+            if not inst or inst["phase"] not in ("starting", "live",
+                                                 "stopping"):
+                with svc.store.write() as cur:
+                    cur.execute(
+                        "UPDATE operations SET state='succeeded', ended_at=?, "
+                        "result=COALESCE(result,'{}') WHERE operation_id=?",
+                        (now, op_id))
+                continue
+            try:
+                stop_result = svc.harnesses.stop(
+                    svc, agent_id, st.get("harness") or inst["harness"],
+                    st.get("handle") or inst["handle"], op_id)
+            except Exception as e:  # noqa: BLE001
+                with svc.store.write() as cur:
+                    cur.execute(
+                        "UPDATE instances SET phase='failed', ended_at=?, "
+                        "error=? WHERE instance_id=?",
+                        (now, f"grace stop failed: {e!r:.120}",
+                         inst["instance_id"]))
+                    cur.execute(
+                        "UPDATE operations SET state='failed', ended_at=?, "
+                        "error=? WHERE operation_id=?",
+                        (now, _json.dumps({"code": "HARNESS_UNAVAILABLE",
+                                           "message": "grace stop failed"},
+                                          ensure_ascii=False), op_id))
+                svc.logger.warning("grace.stop_failed", agent=agent_id,
+                                   error=repr(e)[:120])
+                continue
+            if stop_result == "stopped":
+                with svc.store.write() as cur:
+                    cur.execute(
+                        "UPDATE instances SET phase='stopped', ended_at=?, "
+                        "observation='idle' WHERE instance_id=?",
+                        (now, inst["instance_id"]))
+                    svc.authn.revoke_instance_credentials(
+                        cur, inst["instance_id"])
+                    cur.execute(
+                        "UPDATE agents SET lifecycle='paused', updated_at=? "
+                        "WHERE agent_id=?", (now, agent_id))
+                    cur.execute(
+                        "UPDATE operations SET state='succeeded', ended_at=?,"
+                        " result=COALESCE(result,'{}') WHERE operation_id=?",
+                        (now, op_id))
+                    svc.store.add_event(
+                        cur, entity_type="agent", entity_id=agent_id,
+                        entity_version=inst["generation"],
+                        kind="agent.stopped", actor=st.get("actor")
+                        or "system:scheduler",
+                        payload={"instance_id": inst["instance_id"],
+                                 "grace": st.get("grace"),
+                                 "grace_completed": True})
+                svc.logger.info("grace.stop_completed", agent=agent_id)
+            else:  # unknown outcome: slot retained (existing semantics)
+                with svc.store.write() as cur:
+                    cur.execute(
+                        "UPDATE operations SET state='running', "
+                        "outcome_unknown=1, result=COALESCE(result,'{}') "
+                        "WHERE operation_id=?", (op_id,))
+            if st.get("then_start"):
+                try:
+                    from .runtime_ops import op_start_agent
+                    from .auth import SYSTEM_SUBJECT
+                    op_start_agent(svc, SYSTEM_SUBJECT, agent_id, None)
+                except Exception as e:  # noqa: BLE001
+                    svc.logger.warning("grace.then_start_failed",
+                                       agent=agent_id, error=repr(e)[:120])
 
     def run_deadline_scan(self):
         svc = self.svc
@@ -242,72 +347,117 @@ class Scheduler:
                                     payload={"after": alert_after})
 
     def run_reconcile_wakes(self):
-        """DEF-05: tasks queued past notify_retry_after with no pending
-        wake get their candidates re-notified (idempotent via per-round
-        dedupe keys; bounded rounds). Creates NO tasks/receipts/@notices."""
+        """RDEF-04/05: tasks queued past notify_retry_after get their
+        candidates re-notified. Round counting is PERSISTENT per task
+        (kv wakeround:<task>, scoped to spec_version + candidate set) —
+        deleting notification rows can never reset it. In-flight is judged
+        PER CANDIDATE by pending-wake freshness, so one bad subscriber's
+        stuck pending cannot suppress the whole port. Rounds are paced by
+        notify_retry_after (no per-tick re-send after the task ages past a
+        threshold). Creates NO tasks/receipts/@notices; on cap an explicit
+        task.notify_exhausted event fires once (observable stop, not a
+        silent forget)."""
         import datetime
         import json as _json
         from .ids import new_id
         from .timeutil import parse_rfc3339
         svc = self.svc
         pol = svc.policy()
-        retry_after = pol.get("notify_retry_after", 300)
-        max_rounds = pol.get("notify_max_rounds", 12)
+        retry_after = int(pol.get("notify_retry_after", 300) or 300)
+        max_rounds = int(pol.get("notify_max_rounds", 12) or 12)
         now = svc.now()
         cutoff = format_rfc3339(parse_rfc3339(now)
                                 - datetime.timedelta(seconds=retry_after))
+        # sweep round-state rows whose task left 'queued'
+        with svc.store.write() as cur:
+            cur.execute(
+                "DELETE FROM kv WHERE k LIKE 'wakeround:%' AND substr(k, 11) "
+                "NOT IN (SELECT task_id FROM tasks WHERE state='queued')")
         stuck = svc.store.conn.execute(
-            "SELECT t.task_id, t.target, t.type FROM tasks t WHERE "
-            "t.state='queued' AND t.type IN ('work','notice','message') AND "
-            "t.created_at<=? AND NOT EXISTS (SELECT 1 FROM notifications n "
-            "WHERE n.state='pending' AND n.agent_id IN ("
-            "SELECT s.agent_id FROM subscriptions s WHERE s.port_id = "
-            "substr(t.target,6)) OR EXISTS (SELECT 1 FROM notifications n2 "
-            "WHERE n2.state='pending' AND n2.agent_id = substr(t.target,6))) "
-            "LIMIT 50", (cutoff,)).fetchall()
+            "SELECT t.task_id, t.target, t.type, t.spec_version FROM tasks t "
+            "WHERE t.state='queued' AND t.type IN ('work','notice','message') "
+            "AND t.created_at<=? LIMIT 50", (cutoff,)).fetchall()
         for t in stuck:
             task_row = svc.store.conn.execute(
-                "SELECT * FROM tasks WHERE task_id=?",
+                "SELECT * FROM tasks WHERE task_id=? AND state='queued'",
                 (t["task_id"],)).fetchone()
-            if task_row["target"].startswith("agent:"):
-                agent_id = task_row["target"][6:]
-                arow = svc.store.conn.execute(
-                    "SELECT lifecycle FROM agents WHERE agent_id=?",
-                    (agent_id,)).fetchone()
-                if arow and arow["lifecycle"] == "enabled":
-                    rounds = svc.store.conn.execute(
-                        "SELECT COUNT(*) c FROM notifications WHERE "
-                        "dedupe_key LIKE ?", (f"reconcile:{t['task_id']}:%",)
-                    ).fetchone()["c"]
-                    if rounds < max_rounds:
-                        with svc.store.write() as cur:
-                            cur.execute(
-                                "INSERT OR IGNORE INTO notifications("
-                                "notify_id,agent_id,dedupe_key,message,state,"
-                                "attempts,created_at) VALUES (?,?,?,"
-                                "'对账：仍有待办任务待处理','pending',0,?)",
-                                (new_id("view"), agent_id,
-                                 f"reconcile:{t['task_id']}:{rounds + 1}",
-                                 now))
+            if not task_row:
                 continue
-            port_id = task_row["target"][5:] if                 task_row["target"].startswith("port:") else None
-            if not port_id:
-                continue
-            prow = svc.store.conn.execute(
-                "SELECT handler, state FROM ports WHERE port_id=?",
-                (port_id,)).fetchone()
-            if not prow or prow["handler"] != "agents" or prow["state"] !=                     "enabled":
-                continue
-            rounds = svc.store.conn.execute(
-                "SELECT COUNT(*) c FROM notifications WHERE dedupe_key LIKE ?",
-                (f"reconcile:{t['task_id']}:%",)).fetchone()["c"]
-            if rounds >= max_rounds:
-                continue
+            # candidate list honoring the same gates as first notify
+            # (enabled/lifecycle/capacity/decline)
             with svc.store.write() as cur:
-                notify_new_task(svc, cur, t["task_id"], task_row["target"],
-                                task_row["type"],
-                                dedupe_prefix=f"reconcile:{t['task_id']}:"
-                                f"{rounds + 1}")
+                candidates = _task_candidates(cur, svc, t["task_id"],
+                                              task_row["target"],
+                                              task_row["type"])
+            if not candidates:
+                continue
+            st = svc.store.kv_get(f"wakeround:{t['task_id']}", {}) or {}
+            if not isinstance(st, dict):
+                st = {}
+            st.setdefault("total", 0)     # lifetime rounds (dedupe suffix)
+            st.setdefault("offset", 0)    # rounds at last condition reset
+            if (st.get("spec") != task_row["spec_version"]
+                    or st.get("candidates") != candidates):
+                # condition change (spec version or candidate set) resets the
+                # CAP counter; the lifetime total keeps dedupe keys unique
+                st.update({"spec": task_row["spec_version"],
+                           "candidates": candidates, "offset": st["total"],
+                           "exhausted": False})
+            cap_rounds = int(st["total"]) - int(st["offset"])
+            if cap_rounds >= max_rounds:
+                if not st.get("exhausted"):
+                    st["exhausted"] = True
+                    st["capped_at"] = now
+                    svc.store.kv_set(f"wakeround:{t['task_id']}", st)
+                    with svc.store.write() as cur:
+                        svc.store.add_event(
+                            cur, entity_type="task", entity_id=t["task_id"],
+                            kind="task.notify_exhausted",
+                            actor="system:scheduler",
+                            payload={"rounds": cap_rounds, "max_rounds": max_rounds,
+                                     "candidates": candidates,
+                                     "note": "对账重唤醒轮次已达上限；任务仍在"
+                                             "队列。spec变更/候选变化/调大"
+                                             "notify_max_rounds后自动重置"})
+                continue
+            if st.get("exhausted"):
+                st["exhausted"] = False  # cap raised via config -> resume
+            # pace rounds by notify_retry_after since the last round fired
+            last_at = st.get("last_at")
+            if last_at:
+                try:
+                    if parse_rfc3339(now) - parse_rfc3339(last_at) < \
+                            datetime.timedelta(seconds=retry_after):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            # per-candidate in-flight: a FRESH pending wake (created within
+            # the retry window) means this candidate is still being served;
+            # a STALE one (dead subscriber) blocks nobody else
+            fresh_cutoff = format_rfc3339(
+                parse_rfc3339(now)
+                - datetime.timedelta(seconds=retry_after))
+            fresh = [r["agent_id"] for r in svc.store.conn.execute(
+                "SELECT DISTINCT agent_id FROM notifications WHERE "
+                "state='pending' AND created_at>?", (fresh_cutoff,)).fetchall()]
+            targets = [a for a in candidates if a not in fresh]
+            if not targets:
+                continue
+            round_no = int(st["total"]) + 1
+            inserted = 0
+            with svc.store.write() as cur:
+                for ag in targets:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO notifications(notify_id,agent_id,"
+                        "dedupe_key,message,state,attempts,created_at) VALUES "
+                        "(?,?,?, '对账：仍有待办任务待处理','pending',0,?)",
+                        (new_id("view"), ag,
+                         f"reconcile:{t['task_id']}:{round_no}", now))
+                    inserted += cur.execute("SELECT changes()").fetchone()[0]
+            if inserted:
+                st["total"] = round_no
+                st["last_at"] = now
+                svc.store.kv_set(f"wakeround:{t['task_id']}", st)
 
     def run_notifications(self):
         svc = self.svc
@@ -352,10 +502,14 @@ class Scheduler:
                              n["notify_id"]))
 
     def run_due_restarts(self):
-        """DEF-03: start agents whose scheduled crash-restart backoff has
-        elapsed. Honors lifecycle (enabled only), restart_on_exit, the
-        per-hour cap and a unique live slot; resets the attempt counter
-        once the agent has been up for a stable hour."""
+        """RDEF-03: crash-restart plans are a recoverable state machine
+        (kv restart:<agent>): scheduled -> starting -> (success: plan done |
+        failure: state=failed, plan retained and re-queued at the same
+        backoff step; 3 consecutive start failures or the per-hour crash
+        cap -> awaiting_intervention, queryable, never silently dropped).
+        A daemon crash between the consume-transition and the start call
+        recovers: the next tick sees state=starting with a stale started_at
+        and no live instance and treats it as a failed attempt."""
         import datetime
         import json as _json
         from .timeutil import parse_rfc3339
@@ -367,17 +521,45 @@ class Scheduler:
             agent_id = r["k"].split(":", 1)[1]
             try:
                 st = _json.loads(r["v"])
-            except ValueError:
+            except (ValueError, TypeError):
                 continue
+            if not isinstance(st, dict):
+                continue
+            state = st.get("state") or "scheduled"
+            if state == "awaiting_intervention":
+                continue  # explicit pending-intervention; manual start clears
             nxt = st.get("next_allowed_at")
             if not nxt:
                 continue
-            # stable for an hour since last scheduled attempt -> reset
+            # stable for an hour since the last scheduled attempt -> reset
             try:
-                if parse_rfc3339(now) - parse_rfc3339(nxt) >                         datetime.timedelta(hours=1):
-                    svc.store.kv_set(f"restart:{agent_id}", {})
-                    continue
+                stable_gap = parse_rfc3339(now) - parse_rfc3339(nxt)
             except (ValueError, TypeError):
+                continue
+            if stable_gap > datetime.timedelta(hours=1):
+                svc.store.kv_set(f"restart:{agent_id}", {})
+                continue
+            if state == "starting":
+                # recover an attempt whose daemon died mid-start: if the
+                # instance is actually up the plan is done; otherwise the
+                # attempt failed (stale started_at, no live slot)
+                started_at = st.get("started_at") or nxt
+                try:
+                    age = (parse_rfc3339(now)
+                           - parse_rfc3339(started_at)).total_seconds()
+                except (ValueError, TypeError):
+                    age = 1e9
+                if age < 15:
+                    continue  # give a real in-flight start time to finish
+                live = svc.store.conn.execute(
+                    "SELECT 1 FROM instances WHERE agent_id=? AND phase IN "
+                    "('starting','live','stopping')", (agent_id,)).fetchone()
+                if live:
+                    svc.store.kv_set(f"restart:{agent_id}",
+                                     {"attempts": st.get("attempts", 1)})
+                    continue
+                self._restart_attempt_failed(agent_id, st,
+                                             "启动尝试期间daemon重启，结果未知")
                 continue
             if nxt > now:
                 continue
@@ -404,19 +586,72 @@ class Scheduler:
             if svc.store.conn.execute(
                     "SELECT 1 FROM instances WHERE agent_id=? AND phase IN "
                     "('starting','live','stopping')", (agent_id,)).fetchone():
+                # slot taken over by an external start: an old plan must
+                # never override a newer instance
                 svc.store.kv_set(f"restart:{agent_id}", {})
                 continue
-            # consume the schedule before starting (avoid re-entry storms)
-            svc.store.kv_set(f"restart:{agent_id}",
-                             {"attempts": st.get("attempts", 1)})
+            # consume = atomic state transition (not a delete): a crash
+            # after this leaves state=starting, recovered above
+            st2 = dict(st)
+            st2.update({"state": "starting", "started_at": now,
+                        "last_error": None, "op_id": None})
+            svc.store.kv_set(f"restart:{agent_id}", st2)
             try:
                 from .runtime_ops import op_start_agent
                 from .auth import SYSTEM_SUBJECT
                 op_start_agent(svc, SYSTEM_SUBJECT, agent_id, None)
                 svc.logger.info("restart.backoff_fired", agent=agent_id)
+                # success: plan complete; keep attempts for future crashes
+                svc.store.kv_set(f"restart:{agent_id}",
+                                 {"attempts": st.get("attempts", 1)})
             except Exception as e:  # noqa: BLE001
-                svc.logger.warning("restart.backoff_failed", agent=agent_id,
-                                   error=repr(e))
+                self._restart_attempt_failed(agent_id, st, repr(e)[:200])
+
+    def _restart_attempt_failed(self, agent_id: str, st: dict, error: str):
+        """A start attempt failed: keep the plan and re-queue at the SAME
+        backoff step (defer, don't escalate); after 3 consecutive failures
+        enter the explicit awaiting_intervention state."""
+        import datetime
+        from .timeutil import parse_rfc3339
+        svc = self.svc
+        pol = svc.policy()
+        backoff = pol.get("restart_backoff") or [5, 15, 60]
+        attempts = int(st.get("attempts", 1) or 1)
+        step = backoff[min(attempts - 1, len(backoff) - 1)]
+        fail_count = int(st.get("fail_count", 0) or 0) + 1
+        now = svc.now()
+        next_allowed = format_rfc3339(
+            parse_rfc3339(now) + datetime.timedelta(seconds=step))
+        new_state = ("awaiting_intervention"
+                     if fail_count >= 3 else "failed")
+        svc.store.kv_set(f"restart:{agent_id}", {
+            "attempts": attempts,
+            "next_allowed_at": (None if new_state == "awaiting_intervention"
+                                else next_allowed),
+            "state": new_state, "fail_count": fail_count,
+            "last_error": error, "started_at": st.get("started_at"),
+            "op_id": st.get("op_id")})
+        with svc.store.write() as cur:
+            svc.store.add_event(cur, entity_type="agent", entity_id=agent_id,
+                                kind=("agent.restart_stalled"
+                                      if new_state == "awaiting_intervention"
+                                      else "agent.restart_failed"),
+                                payload={"attempts": attempts, "step_s": step,
+                                         "fail_count": fail_count,
+                                         "error": error[:200]})
+        svc.logger.warning("restart.attempt_failed", agent=agent_id,
+                           error=error[:120], fail_count=fail_count)
+
+    @staticmethod
+    def _restart_blocked(svc, agent_id: str, now: str) -> bool:
+        """Automatic start paths (cold start) must not bypass backoff."""
+        st = svc.store.kv_get(f"restart:{agent_id}", {}) or {}
+        if not isinstance(st, dict) or not st:
+            return False
+        if st.get("state") == "awaiting_intervention":
+            return True
+        nxt = st.get("next_allowed_at")
+        return bool(nxt and nxt > now)
 
     def run_cold_start(self):
         """No live candidates: start at most cold_start_batch agents per round,
@@ -452,6 +687,11 @@ class Scheduler:
             except (OSError, ValueError):
                 continue
             if not cfg.get("runtime", {}).get("auto_start", True):
+                continue
+            # RDEF-03: automatic cold start must not bypass crash-restart
+            # backoff (scheduled/failed with a future next_allowed_at, or
+            # awaiting_intervention)
+            if self._restart_blocked(svc, agent_id, svc.now()):
                 continue
             try:
                 from .runtime_ops import op_start_agent

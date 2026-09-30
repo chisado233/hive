@@ -264,6 +264,9 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
             _finish_op(svc, cur, op_id, "succeeded",
                        result={"instance_id": instance_id, "handle": handle,
                                "credential_file": cred_path, "model": model})
+        # RDEF-03: a successful explicit start clears any restart plan
+        # (manual intervention resolves scheduled/failed/awaiting states)
+        svc.store.kv_set(f"restart:{agent_id}", {})
         svc.store.add_event(cur, entity_type="agent", entity_id=agent_id,
                             entity_version=gen, kind="agent.started",
                             actor=subject.ref,
@@ -381,6 +384,62 @@ def op_send_agent(svc, subject, agent_id: str, args, rid) -> dict:
     return {"operation_id": None, "delivery_mode": "queue", "degraded": False}
 
 
+def _grace_seconds(grace, force: bool) -> float:
+    if force or grace in (None, ""):
+        return 0.0
+    from .timeutil import parse_duration
+    try:
+        return float(parse_duration(str(grace)))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _grace_stop(svc, subject, agent_id: str, inst, op_id: str,
+                grace_s: float, grace_raw, reason: str,
+                then_start: bool = False) -> dict:
+    """RDEF-09: the grace window is REAL — hint, wait, then terminate.
+
+    Accepted asynchronously: the instance goes 'stopping' (no new wake
+    delivery; claims and progress commits keep working under existing
+    permissions, credentials stay valid until termination), a save/handoff
+    hint is sent best-effort, and a persistent kv plan lets the scheduler
+    terminate at the deadline (also across daemon restarts)."""
+    import datetime
+    from .timeutil import parse_rfc3339
+    now = svc.now()
+    deadline = format_rfc3339(parse_rfc3339(now)
+                              + datetime.timedelta(seconds=grace_s))
+    with svc.store.write() as cur:
+        cur.execute("UPDATE instances SET phase='stopping' WHERE "
+                    "instance_id=?", (inst["instance_id"],))
+    hint = (f"[系统] 实例将在 {grace_raw} 后停止（期限 {deadline}）：请立即保存"
+            "进度、写交接说明并停止领取新工作；持有任务保留，权限在终止前有效。")
+    hint_sent = True
+    try:
+        svc.harnesses.send(svc, agent_id, inst["harness"], inst["handle"],
+                           hint, op_id)
+    except Exception as e:  # noqa: BLE001
+        hint_sent = False
+        svc.logger.warning("grace.hint_failed", agent=agent_id,
+                           error=repr(e)[:120])
+    svc.store.kv_set(f"gracestop:{op_id}", {
+        "agent_id": agent_id, "instance_id": inst["instance_id"],
+        "op_id": op_id, "deadline": deadline, "grace": grace_raw,
+        "hint_sent": hint_sent, "then_start": then_start,
+        "actor": subject.ref, "reason": reason,
+        "harness": inst["harness"], "handle": inst["handle"]})
+    with svc.store.write() as cur:
+        _finish_op(svc, cur, op_id, "running",
+                   result={"instance_id": inst["instance_id"],
+                           "grace": grace_raw, "grace_deadline": deadline,
+                           "hint_sent": hint_sent,
+                           "note": "已受理：宽限期内提示保存，到期终止"})
+    return {"operation_id": op_id, "instance_id": inst["instance_id"],
+            "lifecycle": "enabled", "instance_stop_result": "grace",
+            "grace": grace_raw, "grace_deadline": deadline,
+            "hint_sent": hint_sent, "grace_pending": True}
+
+
 def op_stop_agent(svc, subject, agent_id: str, reason: str, grace=None,
                   force=False, instance_expected=None, rid=None) -> dict:
     from .agents import get_agent
@@ -403,9 +462,35 @@ def op_stop_agent(svc, subject, agent_id: str, reason: str, grace=None,
                        error={"code": "VERSION_CONFLICT",
                               "message": "实例ID不匹配当前实例"})
         raise HiveError("VERSION_CONFLICT", "实例ID不匹配当前实例")
+    grace_s = _grace_seconds(grace, force)
+    if grace_s > 0:
+        # a grace window already pending for this instance merges into it
+        for row in svc.store.conn.execute(
+                "SELECT k, v FROM kv WHERE k LIKE 'gracestop:%'"):
+            import json as _jg
+            try:
+                gst = _jg.loads(row["v"])
+            except ValueError:
+                continue
+            if gst.get("instance_id") == inst["instance_id"]:
+                return {"operation_id": gst.get("op_id"),
+                        "instance_id": inst["instance_id"],
+                        "lifecycle": "enabled",
+                        "instance_stop_result": "grace",
+                        "grace_deadline": gst.get("deadline"),
+                        "grace_pending": True,
+                        "note": "已有宽限停止在进行中，合并受理"}
+        if inst["phase"] != "stopping":
+            return _grace_stop(svc, subject, agent_id, inst, op_id, grace_s,
+                               str(grace), reason)
     cfg_harness = inst["harness"]
-    stop_result = svc.harnesses.stop(svc, agent_id, cfg_harness, inst["handle"],
-                                     op_id)
+    try:
+        stop_result = svc.harnesses.stop(svc, agent_id, cfg_harness,
+                                         inst["handle"], op_id)
+    except HiveError as e:
+        with svc.store.write() as cur:
+            _finish_op(svc, cur, op_id, "failed", error=e.to_dict())
+        raise
     now = svc.now()
     if stop_result == "stopped":
         with svc.store.write() as cur:
@@ -465,6 +550,21 @@ def op_restart_agent(svc, subject, agent_id: str, reason: str, grace=None,
     get_agent(svc, agent_id)
     old = live_instance(svc, agent_id)
     old_id = old["instance_id"] if old else None
+    grace_s = _grace_seconds(grace, force)
+    if old and grace_s > 0 and old["phase"] != "stopping":
+        # graceful replacement: the grace stop is accepted async; the
+        # scheduler starts the replacement instance right after the old
+        # instance terminates at the deadline
+        with svc.store.write() as cur:
+            op_id = _new_op(svc, cur, subject, "agent.restart",
+                            f"agent:{agent_id}",
+                            {"grace": grace, "force": force,
+                             "mode": "grace"}, reason, rid)
+        res = _grace_stop(svc, subject, agent_id, old, op_id, grace_s,
+                          str(grace), reason, then_start=True)
+        return {"operation_id": op_id, "old_instance_id": old_id,
+                "new_instance_id": None, "grace_pending": True,
+                "note": "宽限停止已受理，到期终止后自动启动替身实例"}
     if old:
         if instance_expected and old["instance_id"] != instance_expected:
             raise HiveError("VERSION_CONFLICT", "实例ID不匹配当前实例")
@@ -564,9 +664,12 @@ def confirm_crash(svc, agent_id: str) -> dict:
 
 
 def _schedule_crash_restart(svc, agent_id: str) -> dict:
-    """DEF-03: schedule the auto-restart after the configured per-attempt
-    backoff — NEVER restart synchronously here. State persists in kv so a
-    daemon restart still honors backoff and the per-hour cap."""
+    """RDEF-03: the restart plan is a RECOVERABLE state machine persisted in
+    kv restart:<agent> — {attempts, next_allowed_at, state, fail_count,
+    last_error, started_at, op_id}. Scheduling only sets state=scheduled;
+    the scheduler's transition to starting (and back on failure) is atomic
+    per tick, so a crash between consume and start, or a failing start,
+    leaves a plan that continues instead of vanishing."""
     import datetime
     from .timeutil import parse_rfc3339
     pol = svc.policy()
@@ -583,14 +686,23 @@ def _schedule_crash_restart(svc, agent_id: str) -> dict:
             svc.store.add_event(cur, entity_type="agent", entity_id=agent_id,
                                 kind="agent.restart_limit",
                                 payload={"recent": recent})
+        _prev = svc.store.kv_get(f"restart:{agent_id}", {}) or {}
+        svc.store.kv_set(f"restart:{agent_id}",
+                         {"attempts": int(_prev.get("attempts", 0) or 0),
+                          "state": "awaiting_intervention",
+                          "fail_count": 0, "last_error":
+                          "RESTART_LIMIT_EXCEEDED", "next_allowed_at": None,
+                          "started_at": None, "op_id": None})
         return {"restarted": False, "reason": "RESTART_LIMIT_EXCEEDED"}
     st = svc.store.kv_get(f"restart:{agent_id}", {}) or {}
-    attempts = int(st.get("attempts", 0)) + 1
+    attempts = int(st.get("attempts", 0) or 0) + 1
     step = backoff[min(attempts - 1, len(backoff) - 1)]
     next_allowed = format_rfc3339(
         parse_rfc3339(now) + datetime.timedelta(seconds=step))
-    svc.store.kv_set(f"restart:{agent_id}",
-                     {"attempts": attempts, "next_allowed_at": next_allowed})
+    svc.store.kv_set(f"restart:{agent_id}", {
+        "attempts": attempts, "next_allowed_at": next_allowed,
+        "state": "scheduled", "fail_count": int(st.get("fail_count", 0) or 0),
+        "last_error": None, "started_at": None, "op_id": None})
     with svc.store.write() as cur:
         svc.store.add_event(cur, entity_type="agent", entity_id=agent_id,
                             kind="agent.restart_scheduled",

@@ -233,6 +233,14 @@ MIGRATIONS: list[str] = [
     "ALTER TABLE idempotency ADD COLUMN lease_until TEXT",
     # 003 notification jitter window (DEF-05)
     "ALTER TABLE notifications ADD COLUMN send_after TEXT",
+    # 004 executor fencing for slow-command lease takeover (RDEF-01): the
+    # takeover bumps the generation, so an old lease holder resuming after a
+    # takeover can never clobber the new executor's backfilled response
+    "ALTER TABLE idempotency ADD COLUMN executor_gen INTEGER NOT NULL DEFAULT 0",
+    # 005 normalized workspace ownership key (RDEF-07): unique index makes
+    # concurrent same-directory binding fail at the DB level (one writer
+    # wins, the other gets INVALID_ARGUMENT, derived files never clobber)
+    "ALTER TABLE agents ADD COLUMN workspace_key TEXT",
 ]
 
 def _split_statements(script: str) -> list[str]:
@@ -250,6 +258,33 @@ def _split_statements(script: str) -> list[str]:
     if tail:
         out.append(tail)
     return out
+
+
+def workspace_key(path) -> str | None:
+    """Normalized identity of a workspace path for ownership comparison
+    (RDEF-07): absolute + `..`/trailing-separator resolution + junction and
+    8.3-short-name expansion when the target exists + OS case folding, so
+    aliases of one physical directory can never bind two agents."""
+    import sys
+    if not path:
+        return None
+    p = os.path.abspath(os.path.normpath(str(path)))
+    if os.path.exists(p):
+        try:
+            p = os.path.realpath(p)
+        except OSError:
+            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                buf = ctypes.create_unicode_buffer(1024)
+                n = ctypes.windll.kernel32.GetLongPathNameW(p, buf,
+                                                            len(buf))
+                if n and buf.value:
+                    p = buf.value
+            except Exception:  # noqa: BLE001
+                pass
+    return os.path.normcase(os.path.normpath(p))
 
 
 _EXTRA = [
@@ -308,6 +343,7 @@ class Store:
             row = cur.execute(
                 "SELECT MAX(version) v FROM schema_migrations").fetchone()
             current = row["v"] or 0
+            applied = 0
             for i, script in enumerate(MIGRATIONS, start=1):
                 if i <= current:
                     continue
@@ -316,6 +352,29 @@ class Store:
                 cur.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?,?)",
                     (i, format_rfc3339(now_utc())))
+                applied = i
+            if applied >= 5 or (current >= 5 and applied == 0):
+                # RDEF-07: backfill workspace keys (oldest agent wins a
+                # legacy duplicate; the loser keeps NULL and stays covered
+                # by the runtime path check), then enforce uniqueness
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_wskey ON "
+                    "agents(workspace_key) WHERE workspace_key IS NOT NULL")
+                rows = cur.execute(
+                    "SELECT agent_id, workspace_path FROM agents WHERE "
+                    "workspace_key IS NULL AND workspace_path IS NOT NULL "
+                    "ORDER BY created_at").fetchall()
+                for r in rows:
+                    k = workspace_key(r["workspace_path"])
+                    if not k:
+                        continue
+                    try:
+                        cur.execute(
+                            "UPDATE agents SET workspace_key=? WHERE "
+                            "agent_id=? AND workspace_key IS NULL",
+                            (k, r["agent_id"]))
+                    except sqlite3.IntegrityError:
+                        pass  # legacy duplicate of an older binding
             cur.execute("INSERT OR REPLACE INTO kv(k,v) VALUES('schema_version',?)",
                         (str(SCHEMA_VERSION),))
             cur.execute("COMMIT")

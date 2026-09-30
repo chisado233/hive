@@ -120,7 +120,7 @@ check("second crash escalates backoff (attempts=2, step>=5s)",
       st.get("attempts") == 2 and st.get("next_allowed_at"),
       sched[:120])
 # paused agent never auto-restarts
-cli("control", "agent", "stop", B, "--reason", "def0305 pause", cred=owner)
+cli("control", "agent", "stop", B, "--force", "--reason", "def0305 pause", cred=owner)
 cli("control", "test", "harness", B, "--action", "crash", cred=owner)
 cli("control", "test", "clock", "advance", "--by", "10m", cred=owner)
 time.sleep(2.5)
@@ -235,7 +235,7 @@ if cl.get("ok"):
     cli("emit", "done", t_stuck, "--claim", cl["claim_id"], "--text", "done",
         "--credential-file", fx["credentials"]["A"])
 for ag in (A, B, C2):
-    cli("control", "agent", "stop", ag, "--reason", "def0305 teardown",
+    cli("control", "agent", "stop", ag, "--force", "--reason", "def0305 teardown",
         cred=owner)
 cli("control", "system", "stop", "--reason", "def0305 done", cred=owner)
 

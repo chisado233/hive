@@ -125,6 +125,12 @@ def h_system_config(svc, subject, args, rid):
     for k, v in patch.items():
         if k not in svc.policy():
             raise HiveError("SCHEMA_UNSUPPORTED", f"未知策略键 {k}")
+        # typed range check where a bad value would break pacing (RDEF-04)
+        if k == "notify_max_rounds" and (
+                not isinstance(v, int) or isinstance(v, bool)
+                or not 1 <= v <= 1000):
+            raise HiveError("INVALID_ARGUMENT",
+                            "notify_max_rounds 须为 1..1000 整数")
         pol[k] = v
     rev = svc.policy_revision() + 1
     with svc.store.write() as cur:

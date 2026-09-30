@@ -381,6 +381,7 @@ SQL 事务同时提交状态、事件、idempotency 和待发送 outbox。Outbox
 | reconcile_interval | 60s | 对账周期 |
 | notify_jitter | 0–3s | 活跃候选短错峰 |
 | notify_retry_after | 5m | 未领再核实，不无条件刷屏 |
+| notify_max_rounds | 12 | 对账重唤醒轮次上限（1..1000）；达上限记一次 task.notify_exhausted 异常事件并可查询，任务规格/候选变化或调大上限后自动重置 |
 | unclaimed_alert_after | 15m | 只记系统异常，无隐藏业务终态 |
 | cold_start_batch | 1 | 无活实例时每轮拉起一个 |
 | send_unknown_retry_after | 5m | busy/unknown 时合并低频提醒 |

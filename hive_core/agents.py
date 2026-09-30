@@ -8,6 +8,7 @@ import shutil
 
 from .errors import HiveError
 from .ids import new_id
+from .store import workspace_key
 from .timeutil import format_rfc3339, now_utc
 
 CONFIG_TOP = {"schema_version", "name", "description", "instructions", "skills",
@@ -133,15 +134,29 @@ def resolve_workspace(svc, agent_id: str, cfg: dict) -> str:
 
 
 def _workspace_in_use(svc, agent_id: str, path: str) -> str | None:
-    """Another agent bound to the same workspace? (shared-root overwrite
-    guard: system derived files must not clobber each other)."""
+    """Another agent bound to the same physical workspace? (RDEF-07:
+    comparison uses the normalized workspace_key — case, trailing
+    separators, .., junction/short-name aliases all resolve to one key —
+    plus the DB unique key index as the concurrency backstop.)"""
+    from .store import workspace_key
+    key = workspace_key(path)
+    if not key:
+        return None
     for row in svc.store.conn.execute(
-            "SELECT agent_id, workspace_path FROM agents WHERE agent_id<>?",
-            (agent_id,)):
-        other = row["workspace_path"]
-        if other and os.path.abspath(other) == os.path.abspath(path):
+            "SELECT agent_id, workspace_path, workspace_key FROM agents "
+            "WHERE agent_id<>?", (agent_id,)):
+        other_key = row["workspace_key"] or workspace_key(
+            row["workspace_path"])
+        if other_key and other_key == key:
             return row["agent_id"]
     return None
+
+
+def _workspace_conflict_error(clash: str, path: str) -> HiveError:
+    return HiveError("INVALID_ARGUMENT",
+                     f"工位已被 agent {clash} 使用（同一物理目录，含别名形式），"
+                     "不能共享覆盖系统派生文件",
+                     {"workspace": path, "bound_to": clash})
 
 
 def _publish_config(svc, cur, agent_id: str, cfg: dict, base_revision: int,
@@ -161,12 +176,23 @@ def _publish_config(svc, cur, agent_id: str, cfg: dict, base_revision: int,
                 "file_path,published,created_at,published_at) VALUES (?,?,?,1,?,?)",
                 (agent_id, revision, file_path, format_rfc3339(now_utc()),
                  format_rfc3339(now_utc())))
-    cur.execute("UPDATE agents SET current_revision=?, desired_revision=?, "
-                "name=COALESCE(?,name), workspace_path=COALESCE(?,workspace_path), "
-                "updated_at=? WHERE agent_id=?",
-                (revision, revision, cfg.get("name"),
-                 (cfg.get("workspace") or {}).get("path"),
-                 format_rfc3339(now_utc()), agent_id))
+    import sqlite3 as _sq
+    try:
+        cur.execute("UPDATE agents SET current_revision=?, desired_revision=?, "
+                    "name=COALESCE(?,name), workspace_path=COALESCE(?,workspace_path), "
+                    "workspace_key=COALESCE(?,workspace_key), updated_at=? "
+                    "WHERE agent_id=?",
+                    (revision, revision, cfg.get("name"),
+                     (cfg.get("workspace") or {}).get("path"),
+                     workspace_key((cfg.get("workspace") or {})
+                                   .get("path")) if (cfg.get("workspace")
+                                                     or {}).get("path") else None,
+                     format_rfc3339(now_utc()), agent_id))
+    except _sq.IntegrityError:
+        # concurrent bind of the same physical directory (unique index) —
+        # the whole update rolls back, the original agent's files untouched
+        raise _workspace_conflict_error(
+            "concurrent-bind", (cfg.get("workspace") or {}).get("path") or "")
     # subscription projection: enabled flags from config.subscriptions
     cur.execute("DELETE FROM subscriptions WHERE agent_id=?", (agent_id,))
     for sub in cfg.get("subscriptions", []):
@@ -248,20 +274,26 @@ def create_agent(svc, subject, args, rid) -> dict:
         cfg["runtime"]["auto_start"] = bool(args["auto_start"])
     agent_id = new_id("agent")
     ws_path = cfg["workspace"]["path"] or _workspace_root(svc, agent_id)
-    cfg["workspace"]["path"] = os.path.abspath(ws_path)
+    cfg["workspace"]["path"] = os.path.abspath(os.path.normpath(ws_path))
     clash = _workspace_in_use(svc, agent_id, cfg["workspace"]["path"])
     if clash:
-        raise HiveError("INVALID_ARGUMENT",
-                        f"工位已被 agent {clash} 使用，不能共享覆盖系统派生文件",
-                        {"workspace": cfg["workspace"]["path"],
-                         "bound_to": clash})
+        raise _workspace_conflict_error(clash, cfg["workspace"]["path"])
     now = format_rfc3339(now_utc())
+    import sqlite3 as _sq
     with svc.store.write() as cur:
-        cur.execute("INSERT INTO agents(agent_id,name,lifecycle,current_revision,"
-                    "desired_revision,applied_revision,workspace_path,created_at,"
-                    "updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (agent_id, cfg["name"], "enabled", 0, 0, 0,
-                     cfg["workspace"]["path"], now, now))
+        try:
+            cur.execute("INSERT INTO agents(agent_id,name,lifecycle,"
+                        "current_revision,desired_revision,applied_revision,"
+                        "workspace_path,workspace_key,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (agent_id, cfg["name"], "enabled", 0, 0, 0,
+                         cfg["workspace"]["path"],
+                         workspace_key(cfg["workspace"]["path"]), now, now))
+        except _sq.IntegrityError:
+            # concurrent bind of the same physical directory lost the race
+            # (unique workspace_key index) — no derived file was touched
+            raise _workspace_conflict_error("concurrent-bind",
+                                            cfg["workspace"]["path"])
         from .auth import create_subject
         cur.execute("INSERT INTO subjects(subject_id,subject_type,name,created_at,"
                     "metadata) VALUES (?,?,?,?,?)",
@@ -293,22 +325,39 @@ def clone_agent(svc, subject, args, rid) -> dict:
                             "源Agent权限超出调用者可授予范围，拒绝偷渡")
     cfg = _merge(default_config(), src_cfg)
     cfg["name"] = args.get("name") or (src["name"] + "-copy")
+    explicit_ws = None
     if args.get("workspace"):
-        cfg["workspace"]["path"] = os.path.abspath(args["workspace"])
+        # RDEF-08: an EXPLICITLY requested workspace is validated like
+        # create — conflicts are rejected, never silently re-defaulted
+        explicit_ws = os.path.abspath(os.path.normpath(args["workspace"]))
+        cfg["workspace"]["path"] = explicit_ws
     agent_id = new_id("agent")
-    cfg["workspace"]["path"] = cfg["workspace"]["path"] or _workspace_root(svc,
-                                                                           agent_id)
-    clash = _workspace_in_use(svc, agent_id, cfg["workspace"]["path"])
-    if clash:
-        # 克隆不复制工位：同一路径会互相覆盖系统派生文件
-        cfg["workspace"]["path"] = _workspace_root(svc, agent_id)
+    if explicit_ws:
+        clash = _workspace_in_use(svc, agent_id, explicit_ws)
+        if clash:
+            raise _workspace_conflict_error(clash, explicit_ws)
+    else:
+        # inherited/absent: a clone NEVER shares the source's physical
+        # workspace — an inherited clash (the normal case, since configs
+        # store concrete paths) allocates the copy's own default workspace
+        inherited = cfg["workspace"]["path"] or _workspace_root(svc, agent_id)
+        clash = _workspace_in_use(svc, agent_id, inherited)
+        cfg["workspace"]["path"] = (_workspace_root(svc, agent_id)
+                                    if clash else inherited)
     now = format_rfc3339(now_utc())
+    import sqlite3 as _sq
     with svc.store.write() as cur:
-        cur.execute("INSERT INTO agents(agent_id,name,lifecycle,current_revision,"
-                    "desired_revision,applied_revision,workspace_path,created_at,"
-                    "updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (agent_id, cfg["name"], "enabled", 0, 0, 0,
-                     cfg["workspace"]["path"], now, now))
+        try:
+            cur.execute("INSERT INTO agents(agent_id,name,lifecycle,"
+                        "current_revision,desired_revision,applied_revision,"
+                        "workspace_path,workspace_key,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (agent_id, cfg["name"], "enabled", 0, 0, 0,
+                         cfg["workspace"]["path"],
+                         workspace_key(cfg["workspace"]["path"]), now, now))
+        except _sq.IntegrityError:
+            raise _workspace_conflict_error("concurrent-bind",
+                                            cfg["workspace"]["path"])
         cur.execute("INSERT INTO subjects(subject_id,subject_type,name,created_at,"
                     "metadata) VALUES (?,?,?,?,?)",
                     (agent_id, "agent", agent_id, now,
@@ -345,12 +394,10 @@ def update_agent(svc, subject, args, rid) -> dict:
         raise HiveError("INVALID_ARGUMENT", "agent_id 不可指定")
     new_ws = ((new_cfg.get("workspace") or {}).get("path"))
     cur_ws = ((current.get("workspace") or {}).get("path"))
-    if new_ws and (not cur_ws or os.path.abspath(new_ws) !=
-                   os.path.abspath(cur_ws)):
+    if new_ws and (not cur_ws or workspace_key(new_ws) != workspace_key(cur_ws)):
         clash = _workspace_in_use(svc, row["agent_id"], new_ws)
         if clash:
-            raise HiveError("INVALID_ARGUMENT",
-                            f"工位已被 agent {clash} 使用", {"bound_to": clash})
+            raise _workspace_conflict_error(clash, new_ws)
     # permissions changes need grant scope
     if patch.get("permissions"):
         from .auth import can_grant
@@ -398,8 +445,11 @@ def agent_runtime_summary(svc, agent_id: str) -> dict:
         "SELECT COUNT(*) c FROM waits w JOIN tasks t ON t.task_id=w.owner_task_id "
         "WHERE t.owner_subject=? AND w.state='pending'", (agent_id,)).fetchone()["c"]
     live = [i for i in instances if i["phase"] in ("starting", "live", "stopping")]
+    # RDEF-03: the crash-restart plan state is queryable per agent
+    restart_plan = svc.store.kv_get(f"restart:{agent_id}", {}) or {}
     return {
         "lifecycle": row["lifecycle"],
+        "restart_plan": restart_plan or None,
         "instances": [{"instance_id": i["instance_id"], "phase": i["phase"],
                        "observation": i["observation"],
                        "generation": i["generation"],

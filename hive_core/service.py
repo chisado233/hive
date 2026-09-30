@@ -22,6 +22,7 @@ DEFAULT_POLICY = {
     "reconcile_interval": 60,
     "notify_jitter": 3,
     "notify_retry_after": 300,
+    "notify_max_rounds": 12,
     "unclaimed_alert_after": 900,
     "cold_start_batch": 1,
     "send_unknown_retry_after": 300,
@@ -39,7 +40,9 @@ FAULT_POINTS = {
     "tx_before_commit", "rpc_response_drop", "outbox_after_commit",
     "notification_drop", "harness_start_after_launch", "harness_stop_unknown",
     "config_after_publish", "event_duplicate", "event_reorder",
-    "operation_before_execute",
+    "operation_before_execute", "idem_kill_in_tx",
+    "idem_kill_after_reserve", "idem_kill_after_effect",
+    "idem_delay_backfill",
 }
 
 
@@ -108,21 +111,24 @@ class Service:
     # ---------------- dispatch ----------------
     INTERNAL_ROUTES = {"producer.emit"}
 
-    # Fast ledger commands: idempotency reserve + handler + response backfill
-    # commit in ONE transaction — a crash leaves either nothing (rollback,
-    # reservation included) or everything (business effect + response).
-    IDEM_ATOMIC_PREFIXES = ("emit.", "inbox.", "producer.emit",
-                            "control.task.")
-    # Slow commands (harness calls / long operations) cannot hold the global
-    # write lock for their whole duration: they use lease-based takeover.
-    IDEM_SLOW_PREFIXES = ("control.agent.", "control.harness.",
-                          "control.test.", "control.system.",
-                          "control.operation.", "control.port.",
-                          "control.subscription.", "control.permission.",
-                          "control.producer.", "control.trigger.",
-                          "control.channel.", "control.human.",
-                          "control.event.", "control.audit.",
-                          "control.delivery.")
+    # RDEF-01: commands whose handlers perform EXTERNAL effects (harness
+    # spawn/kill/send, smoke sessions) go through the lease path — every
+    # other command (all object-creating, grant-writing, config-publishing
+    # commands included) runs the atomic path: reservation + handler +
+    # response backfill commit in ONE transaction. A crash therefore leaves
+    # either nothing (rollback, reservation included) or the business effect
+    # WITH its response — a same-key retry can never create a second agent,
+    # duplicate grant or second producer/channel, and takeover re-execution
+    # of merge-tolerant effects is confined to the harness ops below.
+    IDEM_EXTERNAL_COMMANDS = frozenset({
+        "control.agent.start",      # harness spawn
+        "control.agent.wake",       # may spawn
+        "control.agent.send",       # harness send
+        "control.agent.stop",       # harness kill
+        "control.agent.restart",    # kill + spawn
+        "control.agent.model",      # may restart (spawn)
+        "control.harness.validate", # --smoke spawns real sessions
+    })
 
     def dispatch(self, subject: Subject, command: str, arguments: dict,
                  request_id: str | None = None) -> tuple[dict, bool]:
@@ -151,7 +157,7 @@ class Service:
             raise HiveError("NOT_IMPLEMENTED", f"命令已定义但尚未实现: {command}")
         args = validate_arguments(cmd, normalized) if cmd else normalized
 
-        atomic = command.startswith(self.IDEM_ATOMIC_PREFIXES)
+        atomic = command not in self.IDEM_EXTERNAL_COMMANDS
         idem_key = None
         if is_query or not request_id:
             result = handler(self, subject, args, request_id)
@@ -183,8 +189,7 @@ class Service:
                                                      payload_hash)
                     if replay is not None:
                         return replay, False
-                    raise HiveError("STORAGE_UNAVAILABLE",
-                                    "同request-id占位冲突", {"retryable": True})
+                    self._idem_orphan_takeover(cur, idem_key, payload_hash)
                 result = handler(self, subject, args, request_id)
                 if kill_in_tx:
                     # real crash path: business rows + reservation + response
@@ -197,24 +202,46 @@ class Service:
                     (json.dumps(result, ensure_ascii=False), *idem_key))
             return self._finish_dispatch(result, command, idem_key)
 
-        # slow path: lease reservation, then handler outside the tx
-        replay = self._idem_reserve_leased(idem_key, payload_hash)
-        if replay is not None:
-            return replay, False
+        # external path: lease reservation with executor fencing, handler
+        # runs outside the tx (effects are merge-tolerant harness ops)
+        reserved = self._idem_reserve_leased(idem_key, payload_hash)
+        if isinstance(reserved, dict):
+            return reserved, False
+        my_gen = reserved
         if self.consume_fault("idem_kill_after_reserve"):
-            # real crash path: reservation committed (own tx), handler never
-            # ran, process dies — orphan lease must later be takeable
+            # real crash window 1: reservation committed (own tx), handler
+            # never ran, process dies — orphan lease must later be takeable
             import os as _os
             _os._exit(70)
         try:
             result = handler(self, subject, args, request_id)
         except BaseException:
             with self.store.write() as cur:
+                # release ONLY our own fencing generation: a takeover that
+                # happened while we were failing must keep its reservation
                 cur.execute("DELETE FROM idempotency WHERE subject_id=? "
                             "AND command=? AND request_id=? AND response "
-                            "IS NULL", idem_key)
+                            "IS NULL AND executor_gen=?", (*idem_key, my_gen))
             raise
-        self._idem_store(idem_key, payload_hash, result)
+        if self.consume_fault("idem_kill_after_effect"):
+            # real crash window 2/3: external effect already happened
+            # (instance live / killed), response not yet backfilled
+            import os as _os
+            _os._exit(70)
+        if self.fault_active("idem_delay_backfill"):
+            # window 4/5 test hook: hold this executor past its lease so a
+            # retry takes over while the original is still alive
+            faults = self.store.kv_get("faults", {}) or {}
+            delay = ((faults.get("idem_delay_backfill") or {})
+                     .get("value", {}) or {}).get("seconds", 5)
+            self.consume_fault("idem_delay_backfill")
+            import time as _t
+            _t.sleep(float(delay))
+        replay = self._idem_store(idem_key, payload_hash, result, my_gen)
+        if replay is not None:
+            # takeover won the backfill: return the CURRENT response, never
+            # clobber the new executor's result with ours
+            return replay, False
         return self._finish_dispatch(result, command, idem_key)
 
     def _finish_dispatch(self, result, command, idem_key):
@@ -223,6 +250,46 @@ class Service:
                             "响应已按故障点丢弃；请求可能已提交，请用相同request-id重试",
                             {"retryable": True})
         return result, True
+
+    def _idem_orphan_takeover(self, cur, key, payload_hash):
+        """Atomic-path orphan recovery (RDEF-01 req 2/6). A NULL-response
+        reservation for an atomic command is unreachable by real crashes
+        (reservation lives inside the business tx); it can only be a legacy
+        pre-fix orphan or external data editing. Never blindly redo: verify
+        the recorded effect via audit_log(request_id) first — refuse with
+        explicit guidance when the effect exists, take over cleanly when
+        no effect was ever recorded."""
+        now = format_rfc3339(now_utc())
+        row = cur.execute("SELECT lease_until FROM idempotency WHERE "
+                          "subject_id=? AND command=? AND request_id=?",
+                          key).fetchone()
+        if row and row["lease_until"] and row["lease_until"] > now:
+            raise HiveError("STORAGE_UNAVAILABLE",
+                            "同request-id占位无响应且租约未到期；请稍后以相同"
+                            "request-id重试，租约到期后可接管",
+                            {"retryable": True,
+                             "lease_until": row["lease_until"]})
+        effects = cur.execute(
+            "SELECT audit_id, action, target FROM audit_log WHERE "
+            "request_id=? ORDER BY audit_id", (key[2],)).fetchall()
+        if effects:
+            raise HiveError(
+                "STORAGE_UNAVAILABLE",
+                "同request-id占位无响应，但审计日志显示效果已提交（旧版本崩溃"
+                "残留或数据被外部改动）；请核对审计记录后处理占位，禁止盲目重做"
+                "以避免重复业务对象",
+                {"retryable": False, "request_id": key[2],
+                 "recorded_effects": [dict(e) for e in effects],
+                 "remediation": "control audit list --request-id 查看已发生效果；"
+                                "确认无误后人工清理该幂等占位或改用新request-id"})
+        # no effect was ever recorded for this request — safe to take over
+        cur.execute("DELETE FROM idempotency WHERE subject_id=? AND command=? "
+                    "AND request_id=? AND response IS NULL", key)
+        cur.execute(
+            "INSERT INTO idempotency(subject_id,command,request_id,"
+            "payload_hash,response,created_at,lease_until) "
+            "VALUES (?,?,?,?,NULL,?,NULL)",
+            (key[0], key[1], key[2], payload_hash, now))
 
     def _idem_replay_check(self, cur, key, payload_hash):
         """Inside a tx: replay if the key already carries a response."""
@@ -246,13 +313,16 @@ class Service:
             return 60
 
     def _idem_reserve_leased(self, key, payload_hash):
-        """Slow-path reservation with a lease. Returns cached response for
-        replay, None when this request owns the execution.
+        """External-path reservation with a lease + executor fencing.
+        Returns a cached response dict for replay, or THIS executor's
+        integer fencing generation when it owns the execution.
 
         Orphaned reservations (holder died before backfill) become takeable
-        once the lease expires: a same-key retry CAS-extends the lease and
-        re-executes — effect safety comes from the command itself being
-        merge-tolerant (slot-unique starts, idempotent stops)."""
+        once the lease expires: a same-key retry CAS-extends the lease,
+        bumps executor_gen and re-executes — effect safety comes from the
+        external commands being merge-tolerant (slot-unique starts,
+        idempotent stops). An old holder resuming after the takeover cannot
+        backfill over the new executor (RDEF-01)."""
         import time as _time
         lease = self._idem_lease_seconds()
         deadline = _time.monotonic() + min(lease + 5, 30)
@@ -263,17 +333,17 @@ class Service:
                 now_utc() + _dt.timedelta(seconds=lease))
             with self.store.write() as cur:
                 row = cur.execute(
-                    "SELECT payload_hash, response, lease_until FROM "
-                    "idempotency WHERE subject_id=? AND command=? AND "
-                    "request_id=?", key).fetchone()
+                    "SELECT payload_hash, response, lease_until, "
+                    "executor_gen FROM idempotency WHERE subject_id=? AND "
+                    "command=? AND request_id=?", key).fetchone()
                 if row is None:
                     cur.execute(
                         "INSERT INTO idempotency(subject_id,command,"
                         "request_id,payload_hash,response,created_at,"
-                        "lease_until) VALUES (?,?,?,?,NULL,?,?)",
+                        "lease_until,executor_gen) VALUES (?,?,?,?,NULL,?,?,0)",
                         (key[0], key[1], key[2], payload_hash, now,
                          lease_until))
-                    return None
+                    return 0
                 if row["payload_hash"] != payload_hash:
                     raise HiveError("IDEMPOTENCY_CONFLICT",
                                     "相同request-id但参数不同",
@@ -284,13 +354,13 @@ class Service:
                            or row["lease_until"] <= now)
                 if expired:
                     took = cur.execute(
-                        "UPDATE idempotency SET lease_until=? WHERE "
-                        "subject_id=? AND command=? AND request_id=? AND "
-                        "response IS NULL AND (lease_until IS NULL OR "
-                        "lease_until<=?)",
+                        "UPDATE idempotency SET lease_until=?, "
+                        "executor_gen=executor_gen+1 WHERE subject_id=? AND "
+                        "command=? AND request_id=? AND response IS NULL AND "
+                        "(lease_until IS NULL OR lease_until<=?)",
                         (lease_until, key[0], key[1], key[2], now)).rowcount
                     if took == 1:
-                        return None  # lease taken over by us
+                        return int(row["executor_gen"]) + 1  # we own it now
             if _time.monotonic() > deadline:
                 raise HiveError("STORAGE_UNAVAILABLE",
                                 "同request-id请求仍在执行中；占位在租约到期后"
@@ -307,12 +377,28 @@ class Service:
             cur.execute("DELETE FROM idempotency WHERE response IS NULL "
                         "AND lease_until IS NOT NULL AND lease_until<?", (now,))
 
-    def _idem_store(self, key, payload_hash, result):
+    def _idem_store(self, key, payload_hash, result, my_gen: int):
+        """CAS backfill fenced on executor_gen. Returns None when we won;
+        returns the CURRENT stored response when a takeover superseded us
+        (old executor must not overwrite the new executor's result)."""
         with self.store.write() as cur:
-            cur.execute(
+            won = cur.execute(
                 "UPDATE idempotency SET response=?, payload_hash=? WHERE "
-                "subject_id=? AND command=? AND request_id=?",
-                (json.dumps(result, ensure_ascii=False), payload_hash, *key))
+                "subject_id=? AND command=? AND request_id=? AND "
+                "response IS NULL AND executor_gen=?",
+                (json.dumps(result, ensure_ascii=False), payload_hash, *key,
+                 my_gen)).rowcount
+            if won == 1:
+                return None
+            row = cur.execute(
+                "SELECT response FROM idempotency WHERE subject_id=? AND "
+                "command=? AND request_id=?", key).fetchone()
+            if row and row["response"] is not None:
+                return json.loads(row["response"])
+            raise HiveError("STORAGE_UNAVAILABLE",
+                            "同request-id请求已被接管且仍在执行中；本执行者"
+                            "结果已让位，请用相同request-id重试获取接管者响应",
+                            {"retryable": True})
 
     def status(self) -> dict:
         pending = self.store.conn.execute(

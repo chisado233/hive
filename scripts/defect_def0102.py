@@ -124,7 +124,7 @@ sizes = [len(brief1.encode("utf-8"))]
 creds_seen = set()
 import re
 for i in range(3):
-    env, code = cli("control", "agent", "restart", E, "--reason",
+    env, code = cli("control", "agent", "restart", E, "--force", "--reason",
                     f"def0102 r{i}", cred=owner)
     if not env.get("ok"):
         check(f"restart {i}", False, env.get("error"))
@@ -178,13 +178,13 @@ open(patch, "w", encoding="utf-8").write(
 env, code = cli("control", "agent", "update", E, "--file", patch,
                 "--reason", "def0102", cred=owner)
 check("config update ok", env.get("ok"))
-cli("control", "agent", "restart", E, "--reason", "after update", cred=owner)
+cli("control", "agent", "restart", E, "--force", "--reason", "after update", cred=owner)
 brief_u, _ = fixture(E)
 check("updated instruction in brief", "DEF0102 新指令标记" in brief_u)
 
 # cleanup (managed): stop managed agents first, then daemon
 for ag in (E, D):
-    cli("control", "agent", "stop", ag, "--reason", "def0102 teardown",
+    cli("control", "agent", "stop", ag, "--force", "--reason", "def0102 teardown",
         cred=owner)
 cli("control", "system", "stop", "--reason", "def0102 done", cred=owner)
 

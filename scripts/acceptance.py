@@ -307,7 +307,7 @@ def teardown_daemon():
     for agent_id in list(MANIFEST["real_harness_agents"]):
         try:
             env, code = owner("control", "agent", "stop", agent_id,
-                              "--reason", "run teardown: 受管实例收尾")
+                              "--force", "--reason", "run teardown: 受管实例收尾")
             rec = {"agent": agent_id,
                    "result": env.get("data", env.get("error"))}
         except Exception as e:  # noqa: BLE001
@@ -561,7 +561,7 @@ def ac_cli_03():
     titles = [i["title"] for i in env["data"]["items"]]
     assert titles.count("response-drop") == 1, titles
     # operation flow: start op accepted -> show
-    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--reason",
+    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason",
                       "cli03")
     expect(env, code, True)
     env, code = owner("control", "agent", "start", fx["agents"]["A"])
@@ -707,7 +707,7 @@ def ac_id_05():
     e = H("C", "control", "agent", "update", fx["agents"]["C"], "--file", patch2,
           "--reason", "self-claim")
     note(f"C self-update ok={e[0].get('ok')} (C可以改自己说明)")
-    env, code = H("C", "control", "agent", "stop", fx["agents"]["B"], "--reason",
+    env, code = H("C", "control", "agent", "stop", fx["agents"]["B"], "--force", "--reason",
                   "prompt自称")
     expect(env, code, False, code="FORBIDDEN", exit_range=[3])
 
@@ -793,7 +793,7 @@ def ac_auth_03():
         "resources": [f"agent:{fx['agents']['B']}"]}, ensure_ascii=False))
     owner("control", "permission", "grant", "--file", g, "--reason", "auth03")
     # A stop B -> forbidden
-    env, code = H("A", "control", "agent", "stop", fx["agents"]["B"], "--reason",
+    env, code = H("A", "control", "agent", "stop", fx["agents"]["B"], "--force", "--reason",
                   "no stop right")
     expect(env, code, False, code="FORBIDDEN", exit_range=[3])
     # A grant itself stop -> GRANT_SCOPE_EXCEEDED
@@ -870,7 +870,7 @@ def ac_ctx_01():
     open(os.path.join(ws, "history", "old.md"), "w", encoding="utf-8").write(
         "# 历史 不应自动加载\n")
     # restart A and inspect fixture startup context
-    owner("control", "agent", "restart", fx["agents"]["A"], "--reason", "ctx01")
+    owner("control", "agent", "restart", fx["agents"]["A"], "--force", "--reason", "ctx01")
     st = _fixture_state(fx["agents"]["A"])
     ctx = (st.get("started_contexts") or [{}])[-1].get("context", "")
     # daemon-side fixture keeps contexts in kv; query via test harness capture
@@ -908,7 +908,7 @@ def ac_ctx_02():
     claim_task("A", t["task_id"])
     c = new_task(actor="A", parent=t["task_id"])
     H("A", "inbox", "wait", "create", t["task_id"], "--on", f"task:{c['task_id']}")
-    owner("control", "agent", "restart", fx["agents"]["A"], "--reason", "ctx02")
+    owner("control", "agent", "restart", fx["agents"]["A"], "--force", "--reason", "ctx02")
     st = _fixture_state(fx["agents"]["A"])
     ctx = (st.get("started_contexts") or [{}])[-1].get("context", "")
     assert t["task_id"] in ctx, "启动摘要应含真实未结Task"
@@ -918,7 +918,7 @@ def ac_ctx_02():
     cl = H("A", "inbox", "claim", t["task_id"])[0]["data"]["results"][0]
     H("A", "emit", "forward", t["task_id"], "--to",
       f"agent:{fx['agents']['B']}", "--claim", cl["claim_id"], "--reason", "ctx02转交")
-    owner("control", "agent", "restart", fx["agents"]["A"], "--reason", "ctx02b")
+    owner("control", "agent", "restart", fx["agents"]["A"], "--force", "--reason", "ctx02b")
     st = _fixture_state(fx["agents"]["A"])
     ctx2 = (st.get("started_contexts") or [{}])[-1].get("context", "")
     note(f"A context after forward still shows history: "
@@ -936,7 +936,7 @@ def ac_ctx_03():
     # exceed context limit (default 512KiB)
     with open(os.path.join(ws, "BIG.md"), "w", encoding="utf-8") as f:
         f.write("x" * (600 * 1024))
-    env, code = owner("control", "agent", "restart", fx["agents"]["A"], "--reason",
+    env, code = owner("control", "agent", "restart", fx["agents"]["A"], "--force", "--reason",
                       "ctx03")
     ok_restart = env.get("ok")
     err = env.get("error", {})
@@ -953,13 +953,13 @@ def ac_ctx_03():
         '{"workspace": {"context_entries": ["MISSING.md"]}}')
     owner("control", "agent", "update", fx["agents"]["A"], "--file", patch,
           "--reason", "ctx03")
-    env, code = owner("control", "agent", "restart", fx["agents"]["A"], "--reason",
+    env, code = owner("control", "agent", "restart", fx["agents"]["A"], "--force", "--reason",
                       "ctx03b")
     expect(env, code, True)
     assert env["data"].get("warnings"), "缺失入口应有warning"
     # workspace preserved across stop/retire
     open(os.path.join(ws, "KEEP.md"), "w", encoding="utf-8").write("keep")
-    owner("control", "agent", "stop", fx["agents"]["A"], "--reason", "ctx03c")
+    owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason", "ctx03c")
     plan = os.path.join(d, "retire.json")
     open(plan, "w", encoding="utf-8").write(
         '{"reason": "ctx03退役", "stop": true}')
@@ -1461,7 +1461,7 @@ def ac_msg_04():
 def ac_msg_05():
     begin_case("AC-MSG-05")
     fx = _ctx["fx"]
-    owner("control", "agent", "stop", fx["agents"]["A"], "--reason", "msg05")
+    owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason", "msg05")
     m = new_task(to=f"agent:{fx['agents']['A']}", type_="message")
     n = new_task(to=f"agent:{fx['agents']['A']}", type_="notice",
                  extra=["--expires-in", "5m"])
@@ -2078,7 +2078,7 @@ def ac_run_02():
         "data"]["config"]["workspace"]["path"]
     marker = os.path.join(ws, "RUN02.md")
     open(marker, "w", encoding="utf-8").write("in-flight")
-    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--reason",
+    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason",
                       "run02")
     expect(env, code, True)
     assert env["data"]["lifecycle"] == "paused"
@@ -2117,7 +2117,7 @@ def ac_run_03():
     shutil.copyfile(os.path.join(HOME, "runtime", "credentials",
                                  f"{old_iid}.json"), old_cred)
     env, code = owner("control", "agent", "restart", fx["agents"]["A"],
-                      "--reason", "run03")
+                      "--force", "--reason", "run03")
     expect(env, code, True)
     new_iid = env["data"]["new_instance_id"]
     assert new_iid and new_iid != old_iid
@@ -2157,7 +2157,7 @@ def ac_run_04():
     db.close()
     assert live == 1
     # paused: model change only updates config
-    owner("control", "agent", "stop", fx["agents"]["A"], "--reason", "run04b")
+    owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason", "run04b")
     env, code = owner("control", "agent", "model", fx["agents"]["A"],
                       "--model", "m3", "--reason", "run04c")
     expect(env, code, True)
@@ -2171,7 +2171,7 @@ def ac_run_04():
 def ac_run_05():
     begin_case("AC-RUN-05")
     fx = _ctx["fx"]
-    owner("control", "agent", "stop", fx["agents"]["A"], "--reason", "prep")
+    owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason", "prep")
     owner("control", "test", "fault", "set", "--point",
           "harness_start_after_launch", "--mode", "once",
           "--value", json.dumps({"entity": fx["agents"]["A"]}))
@@ -2191,7 +2191,7 @@ def ac_run_05():
     # stop with unknown result keeps the slot
     owner("control", "test", "fault", "set", "--point", "harness_stop_unknown",
           "--mode", "always", "--value", json.dumps({"entity": fx["agents"]["A"]}))
-    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--reason",
+    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason",
                       "run05")
     expect(env, code, True)
     assert env["data"]["instance_stop_result"] == "unknown"
@@ -2279,7 +2279,7 @@ def ac_run_07():
     db.close()
     assert live <= 1, f"无双实例，实际 {live}"
     # 4) paused agent: late crash event does not auto-restart
-    owner("control", "agent", "stop", fx["agents"]["B"], "--reason", "run07")
+    owner("control", "agent", "stop", fx["agents"]["B"], "--force", "--reason", "run07")
     env, code = owner("control", "test", "harness", fx["agents"]["B"],
                       "--action", "crash")
     expect(env, code, True)
@@ -2319,56 +2319,167 @@ def ac_har_01():
     env, code = owner("control", "agent", "model", fx["agents"]["A"],
                       "--model", "hm2", "--reason", "har01b")
     expect(env, code, True)
-    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--reason",
+    env, code = owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason",
                       "har01c")
     expect(env, code, True)
     assert env["data"]["instance_stop_result"] == "stopped"
 
 
 
-def zsession_env_preflight(timeout_s: int = 120) -> tuple[bool, str]:
-    """Probe the REAL zsession turn-execution layer: spawn a trivial session
-    and wait for a message_done event. External blocker evidence for the
-    real-harness cases — distinguishes environment from product failures."""
+def zsession_env_preflight(timeout_s: int = 180) -> tuple[str, str]:
+    """RDEF-02: probe the REAL zsession turn-execution layer. Returns
+    (status, note) with status in {"ok", "blocked", "defect"}:
+      - "ok":      execution proven (artifact / status transition / message_done
+                   for THIS session — never global-history absence as evidence)
+      - "blocked": genuine external blocker (daemon unreachable / auth config /
+                   turn not completing) → case records Blocked with the note
+      - "defect":  the preflight's own request construction failed → case must
+                   FAIL loudly (test defect), NOT be recorded as environment
+    Root cause of the previous false attribution: spawn sent a workspace path
+    that was never created → HTTP 400 bad_workspace (preflight bug, not a
+    broken ZCode execution layer)."""
+    import tempfile
+    import urllib.error
     import urllib.request
-    cfg = json.load(open(os.path.expanduser(
-        "~/.zcode/zsession/config.json"), encoding="utf-8"))
-    tok = cfg["tokens"]["owner-local"]["token"]
+    cfg_path = os.path.expanduser("~/.zcode/zsession/config.json")
+    try:
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        tok = ((cfg.get("tokens") or {}).get("owner-local") or {}).get("token")
+    except (OSError, ValueError) as e:
+        return "defect", f"preflight cannot read zsession config: {e!r:.80}"
+    if not tok:
+        return "blocked", "配置错误: zsession owner-local token 未配置"
     base = "http://127.0.0.1:8765"
 
-    def api(method, path, body=None):
+    def api(method, path, body=None, timeout=60):
         req = urllib.request.Request(
             base + path,
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Content-Type": "application/json",
                      "Authorization": "Bearer " + tok}, method=method)
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:200]
+            code = ""
+            try:
+                code = json.loads(detail).get("error", {}).get("code", "") \
+                    if detail.startswith("{") else ""
+            except ValueError:
+                pass
+            raise _ZsApiError(e.code, code, detail)
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            raise _ZsUnreachable(repr(e)[:120])
 
+    probe_ws = os.path.join(tempfile.gettempdir(), f"zs-preflight-{RUN_ID}")
+    marker = os.path.join(probe_ws, "PREFLIGHT_OK.md")
     try:
-        cur = api("GET", "/events?cursor=0&limit=1").get("nextCursor", 0)
+        os.makedirs(probe_ws, exist_ok=True)
+    except OSError as e:
+        return "defect", f"preflight cannot create probe workspace: {e!r:.80}"
+    prompt = ("执行环境预检：请做两件事然后结束：1) 在当前工位创建文件 "
+              "PREFLIGHT_OK.md，内容恰好为一行 EXECUTOR_OK；2) 回复: OK")
+    sid = None
+    try:
         spawn = api("POST", "/sessions/spawn", {
-            "workspace": os.environ.get("TEMP", ".").replace("\\", "/")
-            + "/zs-preflight-ws",
-            "prompt": "只回复: OK", "mode": "yolo",
-            "name": "hive-preflight",
+            "workspace": probe_ws.replace("\\", "/"),
+            "prompt": prompt, "mode": "yolo",
+            "name": f"hive-preflight-{RUN_ID[-6:]}",
             "model": os.environ.get("HIVE_PREFLIGHT_MODEL",
                                     "bigmodel-api/GLM-5.3-Flash")})
-        sid = (spawn.get("sessions") or [{}])[0].get("sessionId")
+        sid = ((spawn.get("sessions") or [{}])[0].get("sessionId")
+               if isinstance(spawn.get("sessions"), list)
+               else spawn.get("sessionId"))
+        if not sid:
+            return "defect", f"preflight spawn response unparseable: " \
+                             f"{json.dumps(spawn)[:120]}"
+        events_cur = None
+        saw_working = False
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            evs = api("GET", f"/events?cursor={cur}&limit=200").get("events", [])
-            for e in evs:
-                if e.get("type") == "message_done" and sid in json.dumps(
-                        e.get("data", {})):
+            # proof 1 (strongest): actual artifact produced by the turn
+            if os.path.isfile(marker):
+                try:
+                    body = open(marker, encoding="utf-8").read().strip()
+                except OSError:
+                    body = "<unreadable>"
+                if "EXECUTOR_OK" in body:
                     api("POST", f"/sessions/{sid}/kill", {"force": True})
-                    return True, f"turn completed (probe {sid[:20]})"
-            time.sleep(4)
-        api("POST", f"/sessions/{sid}/kill", {"force": True}) if sid else None
-        return False, (f"no message_done within {timeout_s}s for probe "
-                       f"{sid} — ZCode turn execution layer not completing")
-    except Exception as e:  # noqa: BLE001
-        return False, f"preflight exception: {e!r:.120}"
+                    return "ok", (f"turn execution proven by artifact "
+                                  f"PREFLIGHT_OK.md (probe {sid[:16]}, "
+                                  f"{time.time():.0f})")
+            # proof 2: this session's status made a working->idle transition
+            try:
+                sess = api("GET", f"/sessions/{sid}")
+                status = ((sess.get("session") or {}).get("status")
+                          or sess.get("status"))
+                if status == "working":
+                    saw_working = True
+            except _ZsApiError as e:
+                if e.code == 404:
+                    pass  # registration race; keep polling
+                else:
+                    raise
+            # proof 3: message_done for THIS session (top-level sessionId)
+            try:
+                if events_cur is None:
+                    events_cur = api("GET", "/events?cursor=0&limit=1") \
+                        .get("nextCursor", 0)
+                ev = api("GET", f"/events?cursor={events_cur}&limit=200")
+                events_cur = ev.get("nextCursor", events_cur)
+                for e in ev.get("events", []):
+                    if e.get("type") == "message_done" and (
+                            e.get("sessionId") == sid
+                            or sid in json.dumps(e.get("data", {}))):
+                        if os.path.isfile(marker) or saw_working:
+                            api("POST", f"/sessions/{sid}/kill",
+                                {"force": True})
+                            return "ok", (f"turn execution proven by "
+                                          f"message_done+state (probe "
+                                          f"{sid[:16]})")
+            except _ZsUnreachable:
+                pass  # events feed hiccup: not the sole criterion
+            time.sleep(3)
+        return "blocked", (f"执行层未完成回合: probe {sid} 观察 {timeout_s}s "
+                           f"无产物/无状态推进 (saw_working={saw_working}) — "
+                           f"证据: 无 PREFLIGHT_OK.md、会话状态未完成迁移、"
+                           f"无本会话 message_done")
+    except _ZsApiError as e:
+        if sid:
+            try:
+                api("POST", f"/sessions/{sid}/kill", {"force": True})
+            except (_ZsApiError, _ZsUnreachable):
+                pass
+        if e.code in (400, 422):
+            return "defect", (f"preflight请求被拒(HTTP {e.code} {e.zcode}): "
+                              f"{e.detail[:100]} — 预检自身构造问题，非环境")
+        if e.code in (401, 403):
+            return "blocked", f"配置错误: zsession拒绝认证 HTTP {e.code}"
+        if e.code == 404:
+            return "blocked", f"环境不可达: zsession端点404 ({e.detail[:80]})"
+        return "blocked", f"环境故障: zsession HTTP {e.code} {e.detail[:80]}"
+    except _ZsUnreachable as e:
+        if sid:
+            try:
+                api("POST", f"/sessions/{sid}/kill", {"force": True})
+            except (_ZsApiError, _ZsUnreachable):
+                pass
+        return "blocked", f"环境不可达: zsession daemon连接失败 {e}"
+    finally:
+        if os.path.isdir(probe_ws):
+            import shutil as _sh
+            _sh.rmtree(probe_ws, ignore_errors=True)
+
+
+class _ZsApiError(Exception):
+    def __init__(self, code, zcode, detail):
+        super().__init__(f"HTTP {code} {zcode} {detail}")
+        self.code, self.zcode, self.detail = code, zcode, detail
+
+
+class _ZsUnreachable(Exception):
+    pass
 
 
 @case
@@ -2377,12 +2488,14 @@ def ac_har_02():
     begin_case("AC-HAR-02")
     real = os.environ.get("HIVE_REAL_HARNESS")
     if real:
-        _ok_env, _env_note = zsession_env_preflight()
-        if not _ok_env:
+        _pf_state, _env_note = zsession_env_preflight()
+        if _pf_state == "defect":
+            note("预检自身缺陷(非环境Blocked): " + _env_note)
+            assert False, "预检自身请求缺陷: " + _env_note
+        if _pf_state == "blocked":
             _results["AC-HAR-02"] = {"status": "Blocked",
-                                      "notes": "zsession/ZCode执行层不可用: "
-                                               + _env_note}
-            note("env preflight failed: " + _env_note)
+                                      "notes": "zsession环境: " + _env_note}
+            note("env preflight blocked: " + _env_note)
             raise _Blocked()
 
     if not real:
@@ -2944,7 +3057,7 @@ def ac_sched_02():
     p2 = env["data"]["port"]["port_id"]
     owner("control", "subscription", "add", "--agent", fx["agents"]["A"],
           "--port", p2, "--reason", "s2")
-    owner("control", "agent", "stop", fx["agents"]["B"], "--reason", "s2")
+    owner("control", "agent", "stop", fx["agents"]["B"], "--force", "--reason", "s2")
     for _i in range(10):
         new_task()
     for _i in range(2):
@@ -2965,7 +3078,7 @@ def ac_sched_03():
     fx = _ctx["fx"]
     owner("control", "test", "harness", fx["agents"]["A"], "--action", "busy")
     owner("control", "test", "harness", fx["agents"]["B"], "--action", "idle")
-    owner("control", "agent", "stop", fx["agents"]["B"], "--reason", "s3")
+    owner("control", "agent", "stop", fx["agents"]["B"], "--force", "--reason", "s3")
     t = new_task()
     time.sleep(3)
     ra = _fixture_state(fx["agents"]["A"]).get("received", [])
@@ -3249,7 +3362,7 @@ def ac_rec_06():
                   f"task:{c['task_id']}")
     expect(env, code, True)
     wid = env["data"]["wait"]["wait_id"]
-    owner("control", "agent", "stop", fx["agents"]["A"], "--reason", "rec06")
+    owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason", "rec06")
     # child completes while A stopped
     cl = claim_task("B", c["task_id"])
     H("B", "emit", "done", c["task_id"], "--claim", cl["claim_id"],
@@ -3290,7 +3403,7 @@ def ac_ctrl_01():
     assert not ops, "评论不产生控制操作"
     # A restart B forbidden
     env, code = H("A", "control", "agent", "restart", fx["agents"]["B"],
-                  "--reason", "ctrl01")
+                  "--force", "--reason", "ctrl01")
     expect(env, code, False, code="FORBIDDEN", exit_range=[3])
     # owner grants restart right; retry with new request
     d = _ctx["case_dir"]
@@ -3301,7 +3414,7 @@ def ac_ctrl_01():
         "resources": [f"agent:{fx['agents']['B']}"]}, ensure_ascii=False))
     owner("control", "permission", "grant", "--file", g, "--reason", "ctrl01")
     env, code = H("A", "control", "agent", "restart", fx["agents"]["B"],
-                  "--reason", "ctrl01授权后")
+                  "--force", "--reason", "ctrl01授权后")
     expect(env, code, True)
     env, _ = owner("control", "agent", "show", fx["agents"]["B"], "--runtime")
     inst_after = (env["data"]["runtime"]["active_instance"] or {}).get(
@@ -3318,7 +3431,7 @@ def ac_ctrl_02():
     fx = _ctx["fx"]
     env, _ = owner("control", "agent", "show", fx["agents"]["B"], "--runtime")
     old_iid = env["data"]["runtime"]["active_instance"]["instance_id"]
-    owner("control", "agent", "restart", fx["agents"]["B"], "--reason", "c2")
+    owner("control", "agent", "restart", fx["agents"]["B"], "--force", "--reason", "c2")
     env, _ = owner("control", "agent", "show", fx["agents"]["B"], "--runtime")
     new_iid = env["data"]["runtime"]["active_instance"]["instance_id"]
     # stop bound to old instance -> conflict
@@ -3349,7 +3462,7 @@ def ac_ctrl_03():
     owner("control", "test", "fault", "set", "--point",
           "operation_before_execute", "--mode", "always")
     env, code = owner("control", "agent", "stop", fx["agents"]["C"],
-                      "--reason", "c3")
+                      "--force", "--reason", "c3")
     expect(env, code, True)
     # find accepted op
     env, _ = owner("control", "operation", "list", "--state", "accepted")
@@ -3373,7 +3486,7 @@ def ac_ctrl_03():
         expect(env, code, False, code="OP_NOT_CANCELLABLE", exit_range=[5])
     # instance lifecycle via stop completes
     env, code = owner("control", "agent", "stop", fx["agents"]["C"],
-                      "--reason", "c3final")
+                      "--force", "--reason", "c3final")
     expect(env, code, True)
 
 
@@ -3597,7 +3710,7 @@ def ac_store_04():
         env, code = owner("control", "task", "list", "--state", state)
         expect(env, code, True)
     # stop agent: nothing deleted
-    owner("control", "agent", "stop", fx["agents"]["A"], "--reason", "s4")
+    owner("control", "agent", "stop", fx["agents"]["A"], "--force", "--reason", "s4")
     assert peek("owner", t2["task_id"])["state"] == "claimed"
     assert peek("owner", t1["task_id"])["state"] == "done"
     # no auto-clean of pending records
@@ -3705,12 +3818,14 @@ def ac_e2e_02():
     begin_case("AC-E2E-02")
     real = os.environ.get("HIVE_REAL_HARNESS")
     if real:
-        _ok_env, _env_note = zsession_env_preflight()
-        if not _ok_env:
+        _pf_state, _env_note = zsession_env_preflight()
+        if _pf_state == "defect":
+            note("预检自身缺陷(非环境Blocked): " + _env_note)
+            assert False, "预检自身请求缺陷: " + _env_note
+        if _pf_state == "blocked":
             _results["AC-E2E-02"] = {"status": "Blocked",
-                                      "notes": "zsession/ZCode执行层不可用: "
-                                               + _env_note}
-            note("env preflight failed: " + _env_note)
+                                      "notes": "zsession环境: " + _env_note}
+            note("env preflight blocked: " + _env_note)
             raise _Blocked()
 
     if not real:
@@ -3786,7 +3901,7 @@ def ac_e2e_02():
         content = open(out, encoding="utf-8", errors="replace").read()
         note(f"output.md content head: {content[:80]!r}")
     # 4) instance replacement: stop -> start keeps agent identity
-    env, code = owner("control", "agent", "stop", agent_id, "--reason",
+    env, code = owner("control", "agent", "stop", agent_id, "--force", "--reason",
                       "e2e第二步")
     expect(env, code, True)
     env, code = owner("control", "agent", "start", agent_id)
@@ -3817,12 +3932,14 @@ def ac_e2e_03():
     begin_case("AC-E2E-03")
     real = os.environ.get("HIVE_REAL_HARNESS")
     if real:
-        _ok_env, _env_note = zsession_env_preflight()
-        if not _ok_env:
+        _pf_state, _env_note = zsession_env_preflight()
+        if _pf_state == "defect":
+            note("预检自身缺陷(非环境Blocked): " + _env_note)
+            assert False, "预检自身请求缺陷: " + _env_note
+        if _pf_state == "blocked":
             _results["AC-E2E-03"] = {"status": "Blocked",
-                                      "notes": "zsession/ZCode执行层不可用: "
-                                               + _env_note}
-            note("env preflight failed: " + _env_note)
+                                      "notes": "zsession环境: " + _env_note}
+            note("env preflight blocked: " + _env_note)
             raise _Blocked()
 
     if not real:
@@ -3912,7 +4029,7 @@ def ac_e2e_03():
     # ---- phase 3 task still non-terminal; stop instance 1
     env, _ = owner("control", "task", "show", task_id)
     assert env["data"]["task"]["state"] == "claimed", "停止前任务必须非终态"
-    env, code = owner("control", "agent", "stop", agent_id, "--reason",
+    env, code = owner("control", "agent", "stop", agent_id, "--force", "--reason",
                       "e2e03换实例")
     expect(env, code, True)
     # ---- phase 4 new instance same agent_id; old creds fenced
@@ -3954,7 +4071,7 @@ def ac_e2e_03():
     note(f"continuity: task={task_id} i1={iid1} i2={iid2} "
          f"checkpoint+result both on disk; ended_by={st['result']['ended_by']}")
     # managed cleanup of the real agent
-    owner("control", "agent", "stop", agent_id, "--reason", "e2e03收尾")
+    owner("control", "agent", "stop", agent_id, "--force", "--reason", "e2e03收尾")
 
 
 

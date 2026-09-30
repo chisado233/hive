@@ -65,6 +65,9 @@ class FixtureAdapter:
     def stop(cls, svc, agent_id: str, handle: str, operation_id: str) -> str:
         if svc.fault_active("harness_stop_unknown", entity=agent_id):
             return "unknown"
+        if svc.fault_active("harness_stop_fail", entity=agent_id):
+            svc.consume_fault("harness_stop_fail")
+            raise HiveError("HARNESS_UNAVAILABLE", "stop failed (fault)")
         st = cls.state(svc, agent_id)
         st["running"] = False
         st["observation"] = "idle"
@@ -281,6 +284,10 @@ class ZSessionAdapter:
                 if "404" in e.message and attempt < 5:
                     _time.sleep(1.0)
                     continue
+                # session no longer exists after retries: the stop effect is
+                # already achieved — kill is idempotent, never an error
+                if "404" in e.message:
+                    return "stopped"
                 raise
 
     @classmethod

@@ -141,7 +141,7 @@ env, code = cli("control", "system", "config", "--file", pol,
                 "--reason", "def04短租约", cred=owner)
 check("short idem lease configured", env.get("ok"))
 # precondition: no live instance for A (seed leaves fixture instances up)
-cli("control", "agent", "stop", A, "--reason", "def04 prep", cred=owner)
+cli("control", "agent", "stop", A, "--force", "--reason", "def04 prep", cred=owner)
 env, _ = cli("control", "agent", "show", A, "--runtime", cred=owner)
 assert (env["data"]["runtime"]["active_instance"] or {}).get(
     "instance_id") is None, "A must have no live instance before case 2"
@@ -228,7 +228,7 @@ orphans = db.execute("SELECT COUNT(*) FROM idempotency WHERE response IS "
 db.close()
 check("no orphan reservations at end", orphans == 0, f"orphans={orphans}")
 
-cli("control", "agent", "stop", A, "--reason", "def04 teardown", cred=owner)
+cli("control", "agent", "stop", A, "--force", "--reason", "def04 teardown", cred=owner)
 cli("control", "system", "stop", "--reason", "def04 done", cred=owner)
 with open(os.path.join(RUN, "checks.json"), "w", encoding="utf-8") as f:
     json.dump(checks, f, ensure_ascii=False, indent=2)
