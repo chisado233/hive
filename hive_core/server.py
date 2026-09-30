@@ -17,6 +17,7 @@ from .service import Service
 from .store import open_store
 
 
+
 def make_handler(service: Service):
     logger = service.logger
 

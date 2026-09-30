@@ -37,8 +37,11 @@ def _pick_free_port(preferred=None):
         return s.getsockname()[1]
 
 
+# fixed preferred port only when explicitly pinned (HIVE_ACC_PORT): a
+# shared default port accumulates server-side TIME_WAIT across runs on
+# Windows and intermittently stalls new connections (observed 2026-09-30)
 PORT = str(_pick_free_port(int(os.environ["HIVE_ACC_PORT"]))
-           if os.environ.get("HIVE_ACC_PORT") else _pick_free_port(29962))
+           if os.environ.get("HIVE_ACC_PORT") else _pick_free_port())
 ENDPOINT = f"http://127.0.0.1:{PORT}"
 # secondary ports used by individual cases, kept relative & run-unique
 PORT_B = str(_pick_free_port(int(PORT) + 1))   # AC-ENV-01 fresh home
@@ -97,8 +100,9 @@ def run(*args, cred: str | None = None, home: str | None = None,
             "--endpoint", endpoint or ENDPOINT, "--format", "json"]
     if cred:
         argv += ["--credential-file", cred]
-    if timeout != 60:
-        argv += ["--timeout", str(int(timeout))]
+    # always carry an explicit CLI HTTP budget: the CLI default (15s) is
+    # too small while a real zsession session spawn loads the machine
+    argv += ["--timeout", str(max(10, int(timeout) - 5))]
     argv += [str(a) for a in args]
     p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=timeout, cwd=ROOT)
@@ -4043,11 +4047,25 @@ def ac_e2e_03():
     cred2 = os.path.join(HOME, "runtime", "credentials", f"{iid2}.json")
     assert os.path.isfile(cred2)
     # ---- phase 5 instance 2 continues: final file from checkpoint
-    msg2 = (f"你是该任务的新实例（旧实例 {iid1} 已停止）。读取工位 "
-            f"CHECKPOINT.md 续作第二阶段：把最终结果写入 RESULT.md —— "
-            f"内容一行，包含 E2E03、原实例ID {iid1} 和新实例ID {iid2}。"
-            f"然后领取/确认任务 {task_id} 并用 emit done 结束"
-            f"（凭据文件 {cred2}）。")
+    # retry#1 wording (recorded): instance 2 in run 20260930-103315 read
+    # the checkpoint and appended its takeover, but drifted on the prose
+    # finish instruction; instance 1 executed its EXACT command template
+    # perfectly, so phase 2 now uses exact commands too. Assertions
+    # unchanged; this is the single documented retry, not retry-until-pass.
+    _nl = chr(10)
+    _q = chr(34)
+    msg2 = (
+        f"你是该任务的新实例（旧实例 {iid1} 已停止）。读取工位 "
+        f"CHECKPOINT.md 续作第二阶段，依次完成两件事：" + _nl +
+        f"1) 把最终结果写入工位 RESULT.md —— 恰好一行，必须同时包含 "
+        f"E2E03、原实例ID {iid1} 和新实例ID {iid2}。" + _nl +
+        f"2) 用你的实例凭据结束任务（任务已被本Agent领取，领取凭据ID 记录在 "
+        f"CHECKPOINT.md 中），执行下面这条命令（把 clm_xxx 替换为 "
+        f"CHECKPOINT.md 里的领取凭据ID）：" + _nl +
+        f"python {_q}{CLI}{_q} --home {_q}{HOME}{_q} --endpoint "
+        f"{ENDPOINT} --credential-file {_q}{cred2}{_q} emit done "
+        f"{task_id} --claim clm_xxx --text {_q}E2E03 续作完成{_q}" + _nl +
+        f"完成后本任务即 done。不要做其他改动。")
     env, code = owner("control", "agent", "send", agent_id, "--text", msg2,
                       "--reason", "e2e03第二阶段", timeout=300)
     expect(env, code, True)
@@ -4095,6 +4113,8 @@ def main():
                 status = "Pass"
             except AssertionError as e:
                 status = "Fail"
+                print("      ASSERT FAIL:", str(e)[:300])
+                print(traceback.format_exc()[-900:])
                 _record("assertions", {"ok": False, "fatal": str(e)[:800],
                                        "traceback": traceback.format_exc()[-1500:],
                                        "at": _now()})
@@ -4102,6 +4122,8 @@ def main():
                 status = _results.get(case_id, {}).get("status", "Blocked")
             except Exception as e:  # noqa: BLE001
                 status = "Fail"
+                print("      EXC FAIL:", repr(e)[:300])
+                print(traceback.format_exc()[-900:])
                 tb = traceback.format_exc()[-1500:]
                 _record("assertions", {"ok": False, "fatal": repr(e)[:400],
                                        "traceback": tb, "at": _now()})

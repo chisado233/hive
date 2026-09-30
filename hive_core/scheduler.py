@@ -475,7 +475,7 @@ class Scheduler:
             try:
                 result = svc.harnesses.send(svc, n["agent_id"], inst["harness"],
                                             inst["handle"], n["message"],
-                                            n["notify_id"])
+                                            n["notify_id"], wait_idle=False)
             except Exception:  # noqa: BLE001
                 result = "failed"
             with svc.store.write() as cur:

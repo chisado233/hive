@@ -256,9 +256,34 @@ class ZSessionAdapter:
 
     @classmethod
     def send(cls, spec: dict, handle: str, message: str,
-             mode: str = "queue") -> str:
+             mode: str = "queue", wait_idle: bool = False) -> str:
         import time as _time
         sid = handle.split(":", 1)[1]
+        # queued sends accepted while a turn is still running get stranded
+        # by zsession (verified: input accepted with inputId, never
+        # processed — marathon turns poll for minutes). Wait for idle,
+        # bounded; if the session is still busy when the wait runs out,
+        # deliver with interrupt (startNow) — proven to reach the agent
+        # mid-turn in seconds — instead of queueing into a stranded input.
+        if mode == "queue" and wait_idle:
+            busy = False
+            idle_deadline = _time.monotonic() + 20
+            while _time.monotonic() < idle_deadline:
+                try:
+                    data = cls._req(spec, "GET", f"/sessions/{sid}",
+                                    timeout=15)
+                    status = ((data.get("session") or {}).get("status")
+                              or data.get("status"))
+                    if status == "idle":
+                        break
+                    busy = status in ("working", "busy") or status is None
+                except HiveError:
+                    break  # status probe best-effort; send retries 404 below
+                _time.sleep(1.5)
+            else:
+                busy = True
+            if busy:
+                mode = "interrupt"
         # spawn->send can race session registration; retry briefly on 404
         for attempt in range(6):
             try:
@@ -370,12 +395,14 @@ class Registry:
         return proc_result
 
     def send(self, svc, agent_id: str, harness: str, handle: str, message: str,
-             delivery_id: str, mode: str = "queue") -> str:
+             delivery_id: str, mode: str = "queue",
+             wait_idle: bool = False) -> str:
         kind, spec = self.adapter_for(harness)
         if kind == "fixture":
             return FixtureAdapter.send(svc, agent_id, handle, message, delivery_id)
         if kind == "zsession":
-            return ZSessionAdapter.send(spec, handle, message, mode=mode)
+            return ZSessionAdapter.send(spec, handle, message, mode=mode,
+                                        wait_idle=wait_idle)
         if spec.get("send_mode") == "stdin":
             return ProcessAdapter.send_stdin(svc, handle, message)
         if spec.get("send_mode") == "argv" and spec.get("send_argv"):

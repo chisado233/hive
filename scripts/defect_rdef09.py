@@ -152,9 +152,17 @@ check("no wake delivered to a stopping instance during grace", sent == 0)
 while time.time() - t0 < 12 and phase_of(A)[1] not in (None, "stopped"):
     time.sleep(0.5)
 elapsed = time.time() - t0
-check("termination happened AFTER the full grace window (>=4s)",
-      phase_of(A)[0] is None and elapsed >= 4,
-      f"elapsed={elapsed:.1f}s phase={phase_of(A)}")
+# clock-exact proof: the op's ended_at must be at/after the grace deadline
+# (wall-clock elapsed from before the request includes call latency)
+_op = db1("SELECT ended_at, result FROM operations WHERE operation_id=?",
+          env["data"]["operation_id"])
+import json as _j
+_deadline = ((_j.loads(_op[1]) or {}).get("grace_deadline")
+             if _op and _op[1] else None)
+check("termination happened AFTER the full grace window (clock: ended_at>="
+      "deadline)", phase_of(A)[0] is None and _op[0] and _deadline
+      and _op[0] >= _deadline and elapsed >= 3.2,
+      f"elapsed={elapsed:.1f}s ended={_op[0]} deadline={_deadline}")
 env = cli("control", "operation", "show", env["data"]["operation_id"])
 op = env.get("data", {}).get("operation") or env.get("data", {})
 check("stop op succeeded after grace", op.get("state") == "succeeded",

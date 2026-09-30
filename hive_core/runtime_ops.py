@@ -342,7 +342,7 @@ def op_send_agent(svc, subject, agent_id: str, args, rid) -> dict:
                                 args.get("reason", ""), rid)
             send_mode = "interrupt" if native_interrupt else "queue"
             svc.harnesses.send(svc, agent_id, harness, inst["handle"], text,
-                               op_id, mode=send_mode)
+                               op_id, mode=send_mode, wait_idle=True)
             with svc.store.write() as cur:
                 _finish_op(svc, cur, op_id, "succeeded", result)
             return {"operation_id": op_id, "delivery_mode": "interrupt",
@@ -370,7 +370,8 @@ def op_send_agent(svc, subject, agent_id: str, args, rid) -> dict:
         try:
             result = svc.harnesses.send(svc, agent_id, inst_q["harness"],
                                         inst_q["handle"],
-                                        text or "请查看inbox", "send-direct")
+                                        text or "请查看inbox", "send-direct",
+                                        wait_idle=True)
         except Exception as e:  # noqa: BLE001
             svc.logger.warning("send.direct.failed", agent=agent_id,
                                error=repr(e))

@@ -104,3 +104,49 @@
   续作→done），含 env 预检。
 - 最终回归：88 Pass + 3 Blocked（ZCode 执行层损坏，预检证据齐全，如实声明）。
 - 详细报告：FIX_REPORT.md / REGRESSION_REPORT.md。
+
+## 2026-09-30 第二轮返修（RDEF-01..10，基准 c409490）
+
+- 入库第二轮独立复验报告（INDEPENDENT_REACCEPTANCE_*.md，他人工作原样）。
+- RDEF-01：幂等分类反转（仅7个外置命令，create/grant等全走原子单事务）+
+  executor_gen 执行者围栏（迁移004）+ 孤儿占位审计核实拒绝/干净接管；真实五窗口
+  击杀验证 35/35。
+- RDEF-02：预检根因=spawn 携带未创建工位（400 bad_workspace），执行层实测正常；
+  预检重写（三态 ok/blocked/defect、产物/状态/事件三重证据、预检缺陷记 Fail）；
+  三份旧报告追加强更正附录（保留历史证据）。
+- RDEF-03：退避计划状态机（scheduled/starting/failed/awaiting_intervention，kv持久，
+  消费=状态迁移不删计划）+ 冷启动退避门控 + restart_plan 观测面；25/25。
+- RDEF-04/05：对账轮次持久计数（kv wakeround，total/offset 终身单调 dedupe）+
+  notify_max_rounds 入策略（DESIGN 增量一行）+ task.notify_exhausted 一次性事件 +
+  三路恢复；按候选者判定 pending 新鲜度，坏订阅者不再压制整端口；组合矩阵 33/33。
+- RDEF-06：矩阵记录层全面重写（规定种类/预期/实际/证据/断言/状态；非规定种类抛错）；
+  6失败行定性（CMD-006 凭据校验、CMD-028 启动失败不回滚、CMD-041 replace缺键=产品
+  缺陷；CMD-090 互斥、CMD-010 缺body=测试缺陷）；fill_param_gaps 补齐全部具名行 +
+  声明-证据完整性校验；97/97命令、384/384参数、371行全Pass、0缺口、exit 0。
+- RDEF-07/08：workspace_key 归一（大小写/尾分隔符/../junction/8.3）+ 唯一索引并发
+  兜底（迁移005）；clone 显式冲突拒绝、继承回退保留；18/18。
+- RDEF-09：grace 真实生效（异步受理、stopping 停新唤醒、保存提示送达、全宽限持久
+  等待、到期终止撤凭据；force 跳过；restart 到期自动起替身）；时钟级证明 20/20；
+  测试脚本 44 处 stop/restart 显式 --force 适配。
+- RDEF-10：四态错误码实测稳定（TOKEN_REVOKED=完整token真实送达的证明）；token
+  零泄漏；10/10。
+- 连带修复：port replace INTERNAL_ERROR、create --start 回滚身份、wait --claim 校验、
+  init --default-harness 死参数、stop 异常遗留op、zsession kill 404 幂等。
+- 回归：quicktest 过；88 Pass+3 Blocked（与复验基线一致）；旧套件 25/15/12；
+  新套件 35/33/25/18/20/10；矩阵 0 缺口。
+- 报告：SECOND_FIX_REPORT.md / SECOND_REGRESSION_REPORT.md。
+
+## 2026-09-30 第二轮返修复核（真实通道收口）
+
+- 真实三案例（最终构建）：AC-HAR-02 Pass、AC-E2E-02 Pass（同 run 20260930-114726）、
+  AC-E2E-03 Pass（20260930-114854，七步单链贯通：实例1 claim+CHECKPOINT→force stop→
+  实例2 续作 RESULT.md+自行 emit done，ended_by=agent）。
+- E2E-03 排障链（全部留痕）：两次如实 Fail → 根因1 zsession 队列模式回合中送达丢失
+  （实测 inputId 接受但永不处理；interrupt=startNow 4s 送达）→ 指令类发送 idle-wait+interrupt
+  兜底；根因2 CLI 默认 15s HTTP 超时在真实 spawn 负载下不足 → 驱动器显式携带 --timeout；
+  期间临时请求追踪包装缺陷曾致两试全败，已彻底移除并记录。
+- 机器负载事件：36 个遗留测试 python 进程（manifest 登记 PID 受管清理）+ 遗留会话
+  （账本登记句柄受管 kill 27 个）；清理后恢复。非产品缺陷。
+- 最终回归：88 Pass + 3 Blocked（20260930-115138）；旧套件 25/15/12；新套件
+  35/33/25/18/20/10；矩阵 97/97 命令、384/384 参数、0 缺口。
+- 报告：SECOND_REGRESSION_REPORT.md（含真实案例证据链与资源收尾）。
