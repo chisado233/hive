@@ -1,0 +1,81 @@
+# Hive 指挥台同源 UI 接口说明
+
+版本：webui v2（含会话舱）· 2026-10-01 · 与 hive_core/webui.py 一致
+
+## 0. 认证与总约定
+
+- 全部接口同源：`http://127.0.0.1:19962/ui/api/...`
+- 登录：`POST /ui/api/session` `{token}` → 服务端校验后签发
+  `Set-Cookie: hive_ui=<sid>; Path=/ui; HttpOnly; SameSite=Strict`。
+  token 只用于换取会话，不写入浏览器存储/URL。`POST /ui/api/logout` 销毁。
+- 变更请求必须带自定义头 `X-Requested-With: hive-ui`（CSRF 防线）；
+  浏览器跨站表单无法伪造该头。
+- 幂等：所有变更接受 `request_id`；同一 subject 同一 request_id 重放返回首次结果，
+  不同内容同 ID 拒绝（IDEMPOTENCY_CONFLICT）。前端随草稿固定 request_id。
+- 错误信封：`{"ok": false, "error": {code, message, details, retryable}}`。
+  HTTP 200 ≠ 业务完成；`accepted_only`/`operation_id` 表示受理，需轮询 operation。
+- Agent 凭据不能登录指挥台（FORBIDDEN）；会话查看/发送/取消按
+  `conversation.read/send/cancel` 于 `agent:<id>` 授权，owner/system 全通。
+
+## 1. 星图与项目
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /ui/api/overview?since= | 聚合快照：projects/agents(含 runtime 摘要+实际模型)/ports/subscriptions/flows(在途+15min 内终态)/人工计数/事件增量。分区降级（缺权限的区返回 errors 说明） |
+| GET | /ui/api/projects | 注册项目列表（execution_root 规范化分组） |
+| GET | /ui/api/project/:key/info | 项目文档（TASK_CONTRACT/BRIEF/TASTE…） |
+| GET | /ui/api/project/:key/assets?path= | assets 目录列表（containment） |
+| GET | /ui/api/project/:key/file?path=&download= | 项目内文件受权预览/下载（Range） |
+| GET | /ui/api/agent/:id | agent.show(config+runtime)+相关任务+等待+实际模型落点 |
+| GET | /ui/api/task/:id?mark_seen=1 | task.show(history)+评论+上下文任务+已读登记 |
+
+## 2. 人工通道（裁决）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /ui/api/human/inbox?state=queued\|claimed\|done\|fail\|trash | 人工队列水合列表 |
+| POST | /ui/api/human/answer | `{task, spec_version, text?, data?, attachments?, request_id}`；按 `task.data.ui.fields` 服务端复验必填/范围/步长/选项集合。spec_version 不符 → 409 TASK_SPEC_CHANGED（草稿保留） |
+| POST | /ui/api/human/fail | `{task, spec_version, reason, request_id}` |
+| POST | /ui/api/comment | `{task, text, mentions?, revision_of?, attachments?, request_id}` → emit.comment；**评论不结算任务** |
+| POST | /ui/api/upload | 原始字节（?name=&mime=）→ `<home>/webfiles/<file_id>/`，返回 `{ref:"hive-file:…", path}` |
+| GET | /ui/api/file/:id | 受权下载/预览，支持 HTTP Range（206） |
+| GET | /ui/api/task-file?task=&uri= | 任务附件受权访问：uri 必须属于该任务（attachments/result.artifacts/ui.blocks/checkpoint_refs）且在受管目录内 |
+
+## 3. 会话舱（conversation）
+
+绑定：`conv_bindings`（agent_id+instance_id+generation→session_id，唯一）。
+实例更换后携带旧 instance/generation 的写入被 STALE_INSTANCE 拒绝。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /ui/api/agent/:id/conversation | `{instance, binding, bridge, bridge_connected, capabilities, active_input, pending_permission, tail:{messages,turns,current_turn}}`。bridge=fixture 时 UI 显示「演示模式」 |
+| GET | …/conversation/history?after=&limit= | 事件分页（≤200/页）；`gap_before:true` 表示请求游标已超出保留范围，需触发快照恢复 |
+| GET | …/conversation/stream?after= | SSE。事件帧 `id: <cursor>` + `event: <type>`；15s 心跳；断线用 `?after=<cursor>` 或 Last-Event-ID 恢复。只读通道，关闭不影响 ACP/实例 |
+| POST | …/conversation/input | `{text, mode:queue\|interrupt, attachments?, instance_id?, generation?, request_id}` → 持久入队。同 request_id 重放返回既有输入；同 ID 不同内容拒绝 |
+| POST | …/conversation/cancel | `{instance_id?, generation?, request_id}` → 取消当前活动轮次（取消中/已取消分态；不自动改业务 Task） |
+| GET | …/conversation/inputs | 输入状态与待发送列表 |
+
+输入状态机：`queued → dispatched → running → completed | cancelled | failed | outcome_unknown`。
+`dispatched`=已向桥接发送（不等于模型已处理）；`running` 需上游事实确认；
+桥断开时未决输入一律 `outcome_unknown`（重连先 `_zsession/get_input_state` 对账，不盲目重放）。
+
+事件类型（conv_events.type）：`user.message / agent.delta / agent.message.final /
+agent.thought / tool.call / turn.started / turn.completed / turn.failed /
+turn.cancelled / permission.request / system.note`。工具卡按 `tool_call_id` 归并更新；
+delta 按 `row_id` 就地合并；`replay=true` 标记重放。
+
+## 4. 桥接（bridge）
+
+- `fixture`：协议夹具（test/dev）。`source:'fixture'`，UI 明确标注。 zero 上游依赖。
+- `acp`：`hive_core/convbridge.py AcpBridge` 经 stdio ndjson JSON-RPC 连接
+  `node …/plugins/session-manager/bin/zsession.mjs acp --stdio`。initialize 协商能力；
+  `_meta.zsession` 携带 requestId/inputId/agentId/instanceId/generation；
+  session/request_permission 反向请求登记为待决权限卡。
+  启用方式：daemon 启动时设置 `HIVE_ACP_ADAPTER` 环境变量为该命令行（缺省不启用，
+  自动回退 fixture 并在 UI 标注「上游未就绪」）。
+
+## 5. 与既有命令网关的关系
+
+`/ui/api/command` 白名单转发 41 条只读/受控命令（见 webui.py UI_COMMAND_WHITELIST）。
+control test *、system 管理类、permission grant/revoke 等不在白名单。
+聊天不生成 work：发正式任务走 emit.new（「发任务」按钮打开既有表单）。

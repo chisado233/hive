@@ -259,6 +259,8 @@ def run_daemon(home: str, listen: str, test_mode: bool, log_level: str) -> dict:
     # runtime subsystems
     from .harness import Registry
     service.harnesses = Registry(store, home, service)
+    from .convbridge import ConversationService, FixtureBridge
+    service.conversation = ConversationService(service, FixtureBridge(service))
     from .scheduler import Scheduler
     service.scheduler = Scheduler(service)
     httpd = ThreadingHTTPServer(("127.0.0.1", int(listen.split(":")[1])),
@@ -277,6 +279,8 @@ def run_daemon(home: str, listen: str, test_mode: bool, log_level: str) -> dict:
             httpd.handle_request()
     finally:
         service.scheduler.stop()
+        if getattr(service, "conversation", None) is not None:
+            service.conversation.stop()   # reap ACP/fixture bridge children
         httpd.server_close()
         lock.release()
         store.close()

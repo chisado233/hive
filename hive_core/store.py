@@ -241,6 +241,62 @@ MIGRATIONS: list[str] = [
     # concurrent same-directory binding fail at the DB level (one writer
     # wins, the other gets INVALID_ARGUMENT, derived files never clobber)
     "ALTER TABLE agents ADD COLUMN workspace_key TEXT",
+    # 006 conversation bridge (ACP): durable per-session input queue,
+    # instance bindings and conversation event store. Chat content lives
+    # here, NOT in the ops `events` feed.
+    """
+    CREATE TABLE conv_bindings (
+      binding_id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      instance_id TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      session_id TEXT NOT NULL,
+      project_root TEXT,
+      connection_state TEXT NOT NULL DEFAULT 'pending',
+      source TEXT NOT NULL DEFAULT 'acp',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX idx_conv_binding_agent ON conv_bindings(agent_id);
+    CREATE TABLE conv_inputs (
+      input_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      instance_id TEXT,
+      generation INTEGER,
+      session_id TEXT,
+      mode TEXT NOT NULL DEFAULT 'queue',
+      kind TEXT NOT NULL DEFAULT 'user',
+      text TEXT NOT NULL DEFAULT '',
+      attachments TEXT NOT NULL DEFAULT '[]',
+      state TEXT NOT NULL DEFAULT 'queued',
+      upstream_input_id TEXT,
+      turn_id TEXT,
+      error TEXT,
+      created_by TEXT,
+      created_at TEXT NOT NULL,
+      dispatched_at TEXT, started_at TEXT, ended_at TEXT
+    );
+    CREATE INDEX idx_conv_inputs_agent ON conv_inputs(agent_id, state);
+    CREATE UNIQUE INDEX idx_conv_inputs_rid ON conv_inputs(agent_id, request_id);
+    CREATE TABLE conv_events (
+      cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      session_id TEXT NOT NULL,
+      agent_id TEXT,
+      instance_id TEXT,
+      generation INTEGER,
+      type TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'acp',
+      payload TEXT NOT NULL DEFAULT '{}',
+      turn_id TEXT, row_id TEXT, tool_call_id TEXT, message_id TEXT,
+      upstream_seq INTEGER,
+      replay INTEGER NOT NULL DEFAULT 0,
+      recorded_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_conv_events_session ON conv_events(session_id, cursor);
+    CREATE INDEX idx_conv_events_agent ON conv_events(agent_id, cursor);
+    """,
 ]
 
 def _split_statements(script: str) -> list[str]:

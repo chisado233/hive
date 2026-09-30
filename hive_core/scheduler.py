@@ -146,6 +146,17 @@ class Scheduler:
         self.run_cold_start()
         self.run_outbox()
         self.run_triggers()
+        self.run_conversation_dispatch()
+
+    def run_conversation_dispatch(self):
+        """会话输入派发（非阻塞）：实际 I/O 在桥线程，tick 只触发。"""
+        cs = getattr(self.svc, "conversation", None)
+        if cs is None:
+            return
+        try:
+            cs.tick()
+        except Exception as e:  # noqa: BLE001
+            self.svc.logger.error("conv.tick_failed", error=repr(e))
 
     def run_grace_stops(self):
         """RDEF-09: terminate instances whose accepted grace window has

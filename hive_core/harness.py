@@ -283,7 +283,10 @@ class ZSessionAdapter:
             else:
                 busy = True
             if busy:
-                mode = "interrupt"
+                # 不再静默升级为 interrupt：排队就是排队。等不到空闲就如实
+                # 返回"排队未投递"，由调用方（control.agent.send / 会话队列）
+                # 决定是否显式中断；抢占式送达只能由用户显式选择 interrupt。
+                return "queued-not-delivered"
         # spawn->send can race session registration; retry briefly on 404
         for attempt in range(6):
             try:

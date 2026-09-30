@@ -20,6 +20,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import queue
 import re
 import secrets
 import urllib.parse
@@ -656,7 +657,11 @@ class WebUI:
                 return self._project_get(h, rel[len("project/"):], subject, qs)
 
             if rel.startswith("agent/"):
-                agent_id = urllib.parse.unquote(rel[len("agent/"):])
+                rest = urllib.parse.unquote(rel[len("agent/"):])
+                if "/conversation" in rest:
+                    agent_id, _, sub = rest.partition("/conversation")
+                    return self._conversation_get(h, agent_id, sub, subject, qs)
+                agent_id = rest
                 data = self._dispatch(subject, "control.agent.show",
                                       {"agent": agent_id, "config": True,
                                        "runtime": True})
@@ -969,6 +974,13 @@ class WebUI:
                                     "data": out})
                 return True
 
+            if rel.startswith("agent/"):
+                rest = urllib.parse.unquote(rel[len("agent/"):])
+                if "/conversation" in rest:
+                    agent_id, _, sub = rest.partition("/conversation")
+                    return self._conversation_post(h, agent_id, sub, subject,
+                                                   data, rid)
+
             raise HiveError("NOT_FOUND", f"路径不存在: /ui/api/{rel}")
         except HiveError as e:
             self._err(h, e)
@@ -1004,6 +1016,177 @@ class WebUI:
         out = self._dispatch(subject, "control.human.answer", args, rid)
         self._json(h, 200, {"ok": True, "request_id": rid, "data": out})
         return True
+
+    # ---------------------------------------------------- conversation API
+    def _conv_authz(self, subject, agent_id: str, action: str):
+        # 会话查看/发送/取消按 agent 资源授权；owner/system 全通
+        if subject.subject_type in ("owner", "system"):
+            return
+        self.svc.authz.require(subject, action, f"agent:{agent_id}")
+
+    def _conversation_get(self, h, agent_id: str, sub: str, subject, qs):
+        from . import conversation as conv
+        from .agents import get_agent  # noqa: F401  (existence check below)
+        get_agent(self.svc, agent_id)   # NOT_FOUND if absent
+        if sub in ("", "/"):
+            self._conv_authz(subject, agent_id, "conversation.read")
+            binding = conv.get_binding(self.svc, agent_id)
+            inst = conv.live_instance_of(self.svc, agent_id)
+            bridge = getattr(self.svc, "conversation", None)
+            data = {
+                "agent_id": agent_id,
+                "instance": ({"instance_id": inst["instance_id"],
+                              "generation": inst["generation"],
+                              "phase": inst["phase"]} if inst else None),
+                "binding": binding,
+                "bridge": (bridge.bridge.name if bridge else None),
+                "bridge_connected": bool(
+                    binding and binding.get("connection_state") == "connected"),
+                "capabilities": getattr(getattr(bridge, "bridge", None),
+                                        "capabilities", {}) or {},
+                "active_input": (conv.input_card(conv.active_input(
+                    self.svc, agent_id)) if conv.active_input(
+                    self.svc, agent_id) else None),
+                "pending_permission": conv.pending_permission(
+                    self.svc, agent_id),
+            }
+            if binding:
+                proj = conv.project_messages(self.svc, binding["session_id"],
+                                             limit=120)
+                data["tail"] = proj
+            self._json(h, 200, {"ok": True, "data": data})
+            return True
+        if sub == "/history":
+            self._conv_authz(subject, agent_id, "conversation.read")
+            binding = conv.get_binding(self.svc, agent_id)
+            if not binding:
+                raise HiveError("NO_BINDING", "该 Agent 还没有会话绑定")
+            after = int(qs.get("after") or 0)
+            limit = int(qs.get("limit") or 100)
+            data = conv.history(self.svc, binding["session_id"],
+                                after=after, limit=limit)
+            self._json(h, 200, {"ok": True, "data": data})
+            return True
+        if sub == "/inputs":
+            self._conv_authz(subject, agent_id, "conversation.read")
+            data = {"items": conv.list_inputs(self.svc, agent_id)}
+            self._json(h, 200, {"ok": True, "data": data})
+            return True
+        if sub == "/stream":
+            self._conv_authz(subject, agent_id, "conversation.read")
+            return self._conversation_stream(h, agent_id, qs)
+        raise HiveError("NOT_FOUND", f"会话接口不存在: {sub}")
+
+    def _conversation_post(self, h, agent_id: str, sub: str, subject,
+                           data: dict, rid: str):
+        from . import conversation as conv
+        from .agents import get_agent
+        get_agent(self.svc, agent_id)
+        if sub == "/input":
+            self._conv_authz(subject, agent_id, "conversation.send")
+            out = conv.enqueue_input(
+                self.svc, subject, agent_id=agent_id,
+                text=data.get("text") or "", mode=data.get("mode") or "queue",
+                request_id=rid, kind="user",
+                attachments=data.get("attachments"),
+                instance_id=data.get("instance_id"),
+                generation=data.get("generation"))
+            self._json(h, 200, {"ok": True, "request_id": rid, "data": out})
+            return True
+        if sub == "/cancel":
+            self._conv_authz(subject, agent_id, "conversation.cancel")
+            binding = conv.get_binding(self.svc, agent_id)
+            if not binding:
+                raise HiveError("NO_BINDING", "该 Agent 没有会话绑定")
+            conv.check_instance_fresh(self.svc, agent_id,
+                                      data.get("instance_id"),
+                                      data.get("generation"))
+            active = conv.active_input(self.svc, agent_id)
+            if not active:
+                self._json(h, 200, {"ok": True, "request_id": rid,
+                                    "data": {"cancelled": False,
+                                             "note": "当前没有活动轮次"}})
+                return True
+            conv.set_input_state(self.svc, active["input_id"], "cancelled")
+            bridge = getattr(self.svc, "conversation", None)
+            if bridge:
+                try:
+                    bridge.bridge.cancel_turn(binding, active["turn_id"])
+                except HiveError as e:
+                    self._json(h, 200, {"ok": True, "request_id": rid,
+                                        "data": {"cancelled": False,
+                                                 "upstream_error": e.message}})
+                    return True
+            self._json(h, 200, {"ok": True, "request_id": rid,
+                                "data": {"cancelled": True,
+                                         "input_id": active["input_id"]}})
+            return True
+        if sub == "/permission":
+            self._conv_authz(subject, agent_id, "conversation.send")
+            bridge = getattr(self.svc, "conversation", None)
+            req_id = data.get("request_id")
+            answer = data.get("answer") or {}
+            if bridge and hasattr(bridge.bridge, "answer_permission"):
+                bridge.bridge.answer_permission(req_id, answer)
+            self._json(h, 200, {"ok": True, "request_id": rid,
+                                "data": {"answered": True}})
+            return True
+        raise HiveError("NOT_FOUND", f"会话接口不存在: {sub}")
+
+    def _conversation_stream(self, h, agent_id: str, qs) -> bool:
+        """SSE：订阅该 Agent 会话事件。只读通道；断线后客户端以
+        ?after=<cursor> 或 Last-Event-ID 恢复，缺口由 history 补齐。"""
+        from . import conversation as conv
+        binding = conv.get_binding(self.svc, agent_id)
+        after = int(qs.get("after") or h.headers.get("Last-Event-ID") or 0)
+        h.send_response(200)
+        h.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        h.send_header("Cache-Control", "no-cache")
+        h.send_header("Connection", "keep-alive")
+        h.send_header("X-Accel-Buffering", "no")
+        h.end_headers()
+        h.close_connection = True
+        q = conv.subscribe()
+        try:
+            # 先补历史缺口
+            if binding:
+                backlog = conv.history(self.svc, binding["session_id"],
+                                       after=after, limit=200)
+                for ev in backlog["items"]:
+                    self._sse_write(h, ev)
+                after = backlog["next_after"]
+            self._sse_write(h, {"type": "hello", "cursor": after,
+                                "agent_id": agent_id,
+                                "server_time": self.svc.now()})
+            import time as _t
+            last_beat = _t.monotonic()
+            while not self.svc.shutdown.is_set():
+                try:
+                    ev = q.get(timeout=2.0)
+                except queue.Empty:
+                    ev = None
+                if ev is not None and ev.get("agent_id") == agent_id and \
+                        ev.get("cursor", 0) > after:
+                    self._sse_write(h, ev)
+                    after = ev["cursor"]
+                now = _t.monotonic()
+                if now - last_beat > 15:
+                    self._sse_write(h, {"type": "heartbeat",
+                                        "server_time": self.svc.now()})
+                    last_beat = now
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass           # 客户端断开：关闭网页通道，不影响 ACP/实例
+        finally:
+            conv.unsubscribe(q)
+        return True
+
+    @staticmethod
+    def _sse_write(h, obj: dict):
+        payload = json.dumps(obj, ensure_ascii=False)
+        frame = (f"id: {obj.get('cursor', '')}\nevent: {obj.get('type', 'message')}\n"
+                 f"data: {payload}\n\n").encode("utf-8")
+        h.wfile.write(frame)
+        h.wfile.flush()
 
 
 def svc_allowed(svc, subject, port_id: str) -> bool:

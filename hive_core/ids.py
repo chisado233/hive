@@ -11,6 +11,8 @@ _PREFIXES = {
     "grant": "gnt_", "claim": "clm_", "request": "req_", "delivery": "dlv_",
     "audit": "aud_", "view": "view_", "decline": "dcl_", "transfer": "xfr_",
     "credential": "crd_", "backup": "bkp_", "file": "file_",
+    "input": "inp_", "turn": "trn_", "row": "row_", "toolcall": "tcl_",
+    "binding": "bnd_",
 }
 
 

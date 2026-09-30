@@ -43,13 +43,23 @@ export class Graph {
     defs.innerHTML = `
       <marker id="arr-cyan" viewBox="0 0 10 10" refX="9" refY="5"
         markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-        <path d="M0,0 L10,5 L0,9 z" fill="#43c6d8"></path></marker>
+        <path d="M0,0 L10,5 L0,9 z" fill="#7addf0"></path></marker>
       <marker id="arr-dim" viewBox="0 0 10 10" refX="9" refY="5"
         markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-        <path d="M0,0 L10,5 L0,9 z" fill="#3a4350"></path></marker>
+        <path d="M0,0 L10,5 L0,9 z" fill="#28406b"></path></marker>
       <marker id="arr-amber" viewBox="0 0 10 10" refX="9" refY="5"
         markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-        <path d="M0,0 L10,5 L0,9 z" fill="#e5a33c"></path></marker>`;
+        <path d="M0,0 L10,5 L0,9 z" fill="#e9bf72"></path></marker>
+      <radialGradient id="star-core" cx="42%" cy="40%" r="72%">
+        <stop offset="0%" stop-color="#1b2c4e"></stop>
+        <stop offset="62%" stop-color="#101b33"></stop>
+        <stop offset="100%" stop-color="#0c1529"></stop>
+      </radialGradient>
+      <radialGradient id="star-halo">
+        <stop offset="0%" stop-color="rgba(122,221,240,0.20)"></stop>
+        <stop offset="55%" stop-color="rgba(122,221,240,0.05)"></stop>
+        <stop offset="100%" stop-color="transparent"></stop>
+      </radialGradient>`;
     this.svg.append(defs);
   }
 
@@ -250,18 +260,18 @@ export class Graph {
   }
 
   _nodeColors(node) {
-    if (node.kind === "human") return { ring: "#e5a33c", core: "#241d10" };
-    if (node.kind === "asset") return { ring: "#8f83c9", core: "#1c1a26" };
-    if (node.kind === "port") return { ring: "#3a4350", core: "#161a20" };
+    if (node.kind === "human") return { ring: "#e9bf72", halo: "rgba(233,191,114," };
+    if (node.kind === "asset") return { ring: "#a99ae0", halo: "rgba(169,154,224," };
+    if (node.kind === "port") return { ring: "#28406b", halo: "rgba(122,221,240," };
     const a = node.data;
-    if (a.lifecycle === "paused") return { ring: "#6f7987", core: "#1c2129" };
-    if (a.lifecycle === "retiring") return { ring: "#da9a60", core: "#1c2129" };
+    if (a.lifecycle === "paused") return { ring: "#6b7c99", halo: "rgba(153,170,195," };
+    if (a.lifecycle === "retiring") return { ring: "#e0a06c", halo: "rgba(224,160,108," };
     if (a.instance_count > 0) {
-      if (a.observation === "busy") return { ring: "#43c6d8", core: "#16242a" };
-      if (a.observation === "idle") return { ring: "#57b389", core: "#152219" };
-      return { ring: "#e5a33c", core: "#1c2129" };   // live 但观测未知
+      if (a.observation === "busy") return { ring: "#7addf0", halo: "rgba(122,221,240," };
+      if (a.observation === "idle") return { ring: "#6fd3a7", halo: "rgba(111,211,167," };
+      return { ring: "#e9bf72", halo: "rgba(233,191,114," };   // live 但观测未知
     }
-    return { ring: "#4d5663", core: "#15181d" };     // 无实例：低亮空心
+    return { ring: "#49597a", halo: "rgba(107,124,153," };      // 无实例：低亮
   }
 
   _shortName(a) {
@@ -280,24 +290,28 @@ export class Graph {
     });
     const c = this._nodeColors(node);
     if (node.kind === "agent") {
-      g.append(s("circle", { class: "n-ring", r: 27, stroke: c.ring }));
+      // 恒星：光晕底层 + 核心径向渐变 + 外环
+      g.append(s("circle", { class: "n-halo", r: 34,
+        fill: "url(#star-halo)", stroke: "none" }));
+      const ring = s("circle", { class: "n-ring", r: 24, stroke: c.ring });
       if (node.data.instance_count === 0)
-        g.querySelector(".n-ring").setAttribute("stroke-dasharray", "4 5");
-      g.append(s("circle", { class: "n-core", r: 22, fill: c.core }));
+        ring.setAttribute("stroke-dasharray", "3 6");
+      g.append(ring);
+      g.append(s("circle", { class: "n-core", r: 19, fill: "url(#star-core)" }));
       const glyph = s("text", { class: "n-glyph", y: 1 });
       glyph.textContent = this._shortName(node.data).slice(0, 2);
       g.append(glyph);
-      const label = s("text", { class: "n-label", y: 44 });
+      const label = s("text", { class: "n-label", y: 42 });
       label.textContent = this._shortName(node.data);
       g.append(label);
-      const sub = s("text", { class: "n-sub", y: 58 });
+      const sub = s("text", { class: "n-sub", y: 56 });
       sub.textContent = [node.data.domain, node.data.role].filter(Boolean).join(" · ");
       g.append(sub);
     } else if (node.kind === "asset") {
       g.append(s("rect", { class: "n-ring", x: -26, y: -26, width: 52, height: 52,
-        rx: 10, stroke: c.ring }));
-      g.append(s("rect", { class: "n-core", x: -21, y: -21, width: 42, height: 42,
-        rx: 8, fill: c.core }));
+        rx: 11, stroke: c.ring }));
+      g.append(s("rect", { class: "n-core", x: -20, y: -20, width: 40, height: 40,
+        rx: 8, fill: "url(#star-core)" }));
       const glyph = s("text", { class: "n-glyph", y: 1 });
       glyph.textContent = "资";
       g.append(glyph);
@@ -305,19 +319,20 @@ export class Graph {
       label.textContent = "共享资产库";
       g.append(label);
     } else if (node.kind === "human") {
-      g.append(s("circle", { class: "n-ring", r: 27, stroke: c.ring }));
-      g.append(s("circle", { class: "n-core", r: 22, fill: c.core }));
-      const glyph = s("text", { class: "n-glyph", y: 1, style: "font-size:16px" });
+      g.append(s("circle", { class: "n-halo", r: 34, fill: "url(#star-halo)" }));
+      g.append(s("circle", { class: "n-ring", r: 24, stroke: c.ring }));
+      g.append(s("circle", { class: "n-core", r: 19, fill: "url(#star-core)" }));
+      const glyph = s("text", { class: "n-glyph", y: 1, style: "font-size:15px" });
       glyph.textContent = "👤";
       g.append(glyph);
-      const label = s("text", { class: "n-label", y: 44 });
+      const label = s("text", { class: "n-label", y: 42 });
       label.textContent = "人类决策台";
       g.append(label);
     } else if (node.kind === "port") {
       const d = s("path", { class: "n-core",
-        d: "M0,-11 L11,0 L0,11 L-11,0 Z", fill: c.core, stroke: c.ring });
+        d: "M0,-10 L10,0 L0,10 L-10,0 Z", fill: "#0c1529", stroke: c.ring });
       g.append(d);
-      const label = s("text", { class: "n-sub", y: 24 });
+      const label = s("text", { class: "n-sub", y: 23 });
       label.textContent = node.data.route || node.data.name || "";
       g.append(label);
     }
@@ -346,9 +361,14 @@ export class Graph {
       const ring = g.querySelector(".n-ring");
       if (ring) {
         ring.setAttribute("stroke", c.ring);
-        if (node.data.instance_count === 0) ring.setAttribute("stroke-dasharray", "4 5");
+        if (node.data.instance_count === 0) ring.setAttribute("stroke-dasharray", "3 6");
         else ring.removeAttribute("stroke-dasharray");
       }
+      // 呼吸光晕：仅真实 working（observation==='busy'）；unknown 不伪装 idle
+      const halo = g.querySelector(".n-halo");
+      if (halo)
+        halo.classList.toggle("breathing",
+          node.data.observation === "busy" && node.data.instance_count > 0);
     }
   }
 

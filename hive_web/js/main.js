@@ -7,6 +7,7 @@ import { Graph } from "./graph.js";
 import { Detail } from "./detail.js";
 import { Inbox } from "./inbox.js";
 import { Assets } from "./assets.js";
+import { Nebula } from "./nebula.js";
 
 const $ = (s) => document.querySelector(s);
 
@@ -54,6 +55,8 @@ function showLogin(msg = "") {
 
 function enterApp() {
   $("#app").classList.remove("hidden");
+  if (!window.__nebula)
+    window.__nebula = new Nebula(document.getElementById("nebula"));
   $("#user-chip").textContent = store.me.name + " · " + store.me.type;
   $("#logout-btn").onclick = async () => {
     await api.logout().catch(() => {});
@@ -110,8 +113,15 @@ function onStoreChange(what) {
   if (what === "overview") {
     renderProjectPicker();
     renderNavNodes();
-    if (!store.currentProject && store.projects.length === 1)
-      store.currentProject = store.projects[0].key;
+    if (store.currentProject == null) {
+      const saved = lsGet("hive.lastProject", "");
+      if (saved && store.projects.some(p => p.key === saved))
+        store.currentProject = saved;
+      else if (store.projects.length === 1)
+        store.currentProject = store.projects[0].key;
+      const sel = document.querySelector("#project-picker select");
+      if (sel && store.currentProject) sel.value = store.currentProject;
+    }
     if (firstLayout && store.agents.size) {
       graph.update(true);
       graph.fit();
@@ -141,6 +151,7 @@ function renderProjectPicker() {
         `${p.key}（${p.agents.length}）`)));
   sel.onchange = () => {
     store.currentProject = sel.value || null;
+    lsSet("hive.lastProject", store.currentProject || "");
     firstLayout = true;
     graph.loadPositions();
     graph.update(true);

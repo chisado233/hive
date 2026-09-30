@@ -34,6 +34,7 @@ export class Detail {
 
   // ================= Agent =================
   async agent(agentId, tab = "概览") {
+    if (tab !== "会话" && this._conv) { this._conv.destroy(); this._conv = null; }
     this.show();
     this.body.textContent = "";
     this.body.append(el("div", { class: "inbox-empty" }, "加载中…"));
@@ -61,15 +62,29 @@ export class Detail {
         : el("span", { class: "tag" }, "无运行实例"),
       meta.role ? el("span", { class: "tag amber" }, meta.role) : null,
     ].filter(Boolean)));
-    this.body.append(this._tabs(["概览", "任务", "操作", "事件"], tab,
+    this.body.append(this._tabs(["概览", "会话", "任务", "操作", "事件"], tab,
       t => this.agent(agentId, t)));
     const c = el("div", { class: "dt-content" });
     this.body.append(c);
 
     if (tab === "概览") this._agentOverview(c, a, cfg, rt, d);
+    else if (tab === "会话") this._agentConversation(c, a);
     else if (tab === "任务") this._agentTasks(c, d);
     else if (tab === "操作") this._agentOps(c, a, cfg, rt);
     else this._agentEvents(c, a.agent_id);
+  }
+
+  _agentConversation(c, a) {
+    // 会话舱：真实 ACP/fixture 会话，跨切换保留草稿与阅读位置
+    if (this._conv) this._conv.destroy();
+    c.classList.add("conv-host");
+    import("./conversation.js").then(({ ConversationPane }) => {
+      this._conv = new ConversationPane(c, a, {
+        openTask: (id) => this.ctx.openTask(id),
+        openTaskComposer: (agent) => this._newTaskToAgent(agent),
+      });
+      this._conv.mount();
+    });
   }
 
   _agentOverview(c, a, cfg, rt, d) {
