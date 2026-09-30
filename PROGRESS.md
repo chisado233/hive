@@ -84,3 +84,23 @@
 - 测试环境清理：验收 daemon 已停止（29962 仅 TIME_WAIT 残留）；本轮创建的
   21 个 hive-* zsession 会话已 kill+archive（活跃列表 0）；trigger-platform
   19961 全程未触碰。
+
+
+## 修复轮（独立验收 DEF-01..11，基准 b2288d3）
+
+- 环境隔离：唯一run-id/端口/manifest；quicktest唯一home/端口；29963遗留daemon
+  已受管停止（work/cleanup/DEF-07-cleanup-20260930.json）。
+- DEF-01/02：resolve_workspace 统一工位；STARTUP.md 迁 runtime/startups；25/25。
+- DEF-03：崩溃登记持久退避计划 + run_due_restarts 消费 backoff/限次；12/12。
+- DEF-04：快命令「占位+执行+回填同事务」；慢命令 lease 接管；真实击杀 15/15。
+- DEF-05：run_reconcile_wakes 对账重入队；jitter/send_after/retry_after 真实生效；12/12。
+- DEF-06：TASK-08 翻页稳健、弱断言/禁用分支清零、并发逐子进程入证、REC-04 真实
+  路径、schema 按 profile 精确；顺带修 schema_export 过滤与陈旧启动op两处产品级bug。
+- DEF-08：coverage_matrix.py —— 97/97命令、205/205行、384参数声明全部业务执行。
+- DEF-09/10/11：控制面清单加 system.observe；steer|interrupt 键统一+zsession原生
+  interrupt；smoke 会话回读 + zsession_env_preflight（turn 完成才算真实可用）；
+  restore local-only 语义；占位/排序/双层路径清理。
+- AC-E2E-03：新增真实“任务中途换实例续作”案例（实例1领取+checkpoint→停→实例2
+  续作→done），含 env 预检。
+- 最终回归：88 Pass + 3 Blocked（ZCode 执行层损坏，预检证据齐全，如实声明）。
+- 详细报告：FIX_REPORT.md / REGRESSION_REPORT.md。

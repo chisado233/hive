@@ -79,13 +79,18 @@ def _build_startup_context(svc, agent_id: str, cfg: dict) -> str:
     if ctx.get("workspace_missing"):
         raise HiveError("WORKSPACE_UNAVAILABLE",
                         f"工位目录不存在: {ctx['workspace_missing']}")
-    # system protocol + individual prompt (generated, always current)
+    # system protocol + individual prompt (generated, always current);
+    # both MUST exist in the effective workspace (DEF-01: missing protocol
+    # in the startup brief is an error, never silently skipped)
     agent_md = os.path.join(ws, "agent.md")
     prompt_md = os.path.join(ws, "prompt.md")
     for p in (agent_md, prompt_md):
-        if os.path.isfile(p):
-            with open(p, "r", encoding="utf-8") as f:
-                parts.append(f.read())
+        if not os.path.isfile(p):
+            raise HiveError("WORKSPACE_UNAVAILABLE",
+                            f"工位缺少系统派生文件: {p}",
+                            {"expected": p, "workspace": ws})
+        with open(p, "r", encoding="utf-8") as f:
+            parts.append(f.read())
     for fobj in ctx["files"]:
         parts.append(f"\n\n--- 工位文件 {fobj['name']} ---\n{fobj['content']}")
     missing = ctx.get("missing") or []
@@ -117,12 +122,21 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
         return {"operation_id": None, "instance_id": existing["instance_id"],
                 "already_running": True,
                 "phase": existing["phase"]}
+    # only genuinely-accepted (not yet executed) starts merge; 'running'
+    # ops with outcome_unknown are stale once the slot is free — supersede
     pending = svc.store.conn.execute(
         "SELECT * FROM operations WHERE action='agent.start' AND target=? AND "
-        "state IN ('accepted','running')", (f"agent:{agent_id}",)).fetchone()
+        "state='accepted'", (f"agent:{agent_id}",)).fetchone()
     if pending:
         return {"operation_id": pending["operation_id"], "instance_id": None,
                 "already_running": True, "accepted_only": True}
+    with svc.store.write() as cur:
+        cur.execute(
+            "UPDATE operations SET state='failed', ended_at=?, error=? WHERE "
+            "action='agent.start' AND target=? AND state='running'",
+            (svc.now(), json.dumps({"code": "RUNTIME_OUTCOME_UNKNOWN",
+                                    "message": "槽位已释放，陈旧启动操作失效"}),
+             f"agent:{agent_id}"))
     cfg = get_agent_config(svc, agent_id)
     harness = cfg.get("runtime", {}).get("harness") or \
         svc.policy().get("default_harness")
@@ -162,6 +176,7 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
     warnings = [f"上下文额外入口缺失: {m}" for m in missing] if missing else []
     registry = svc.harnesses
     enriched_context = None
+    startup_file_path = None
     try:
         cred_dir = os.path.join(svc.home, "runtime", "credentials")
         # real harnesses: build the full startup brief (context + connection
@@ -189,10 +204,17 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
                     f"- 用法示例: python \"{_cli}\" --home \"{svc.home}\" "
                     f"--endpoint http://{_listen} --credential-file "
                     f"\"{_cred_file}\" inbox list\n")
-                with open(os.path.join(wsdir, "STARTUP.md"), "w",
-                          encoding="utf-8") as f:
+                # DEF-02: the brief is a per-instance runtime artifact — it
+                # lives under home/runtime/startups/, never in the business
+                # workspace, so business-md scanning can never re-ingest it
+                startup_dir = os.path.join(svc.home, "runtime", "startups",
+                                           agent_id)
+                os.makedirs(startup_dir, exist_ok=True)
+                startup_file = os.path.join(startup_dir, f"{instance_id}.md")
+                with open(startup_file, "w", encoding="utf-8") as f:
                     f.write(_ctx_text)
                 enriched_context = _ctx_text
+                startup_file_path = startup_file
         os.makedirs(cred_dir, exist_ok=True)
         start_options = {
             "model": model, "yolo": bool(cfg.get("runtime", {}).get("yolo", True)),
@@ -204,6 +226,8 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
         }
         if enriched_context is not None:
             start_options["startup_context"] = enriched_context
+        if startup_file_path is not None:
+            start_options["startup_file"] = startup_file_path
         res = registry.start(svc, agent_id, harness, start_options)
     except HiveError as e:
         with svc.store.write() as cur:
@@ -299,19 +323,24 @@ def op_send_agent(svc, subject, agent_id: str, args, rid) -> dict:
         harness = cfg.get("runtime", {}).get("harness")
         caps = svc.harnesses.get_spec(harness).get("capabilities", {}) \
             if harness else {}
+        # unified native-interrupt key: steer OR interrupt (zsession declares
+        # interrupt:true) — a declared capability must actually be used
+        native_interrupt = bool(caps.get("steer") or caps.get("interrupt"))
         # fixture: model_hot/steer not native -> no interrupt unless restart
         fixture_hot = False
         if harness and svc.harnesses.get_spec(harness).get("adapter") == "fixture":
             from .harness import FixtureAdapter
             fixture_hot = FixtureAdapter.capabilities(svc, agent_id).get("events")
-        if caps.get("steer") or fixture_hot:
+        if native_interrupt or fixture_hot:
             result = {"delivery_mode": "interrupt"}
             with svc.store.write() as cur:
                 op_id = _new_op(svc, cur, subject, "agent.send",
                                 f"agent:{agent_id}", {"mode": mode, "text": text},
                                 args.get("reason", ""), rid)
-                svc.harnesses.send(svc, agent_id, harness, inst["handle"], text,
-                                   op_id)
+            send_mode = "interrupt" if native_interrupt else "queue"
+            svc.harnesses.send(svc, agent_id, harness, inst["handle"], text,
+                               op_id, mode=send_mode)
+            with svc.store.write() as cur:
                 _finish_op(svc, cur, op_id, "succeeded", result)
             return {"operation_id": op_id, "delivery_mode": "interrupt",
                     "degraded": False}
@@ -529,29 +558,47 @@ def confirm_crash(svc, agent_id: str) -> dict:
                             payload={"instance_id": inst["instance_id"]})
         _fail_running_ops(cur, agent_id)
     if row["lifecycle"] == "enabled" and cfg.get("runtime", {}).get(
-            "restart_on_exit", True) and not row["lifecycle"] == "paused":
-        hour_ago = format_rfc3339(now_utc().timestamp() - 3600
-                                  if False else now_utc())  # placeholder
-        from datetime import timedelta
-        from .timeutil import parse_rfc3339
-        cutoff = format_rfc3339(parse_rfc3339(svc.now()) - timedelta(hours=1))
-        recent = svc.store.conn.execute(
-            "SELECT COUNT(*) c FROM events WHERE entity_type='agent' AND "
-            "entity_id=? AND kind='agent.started' AND occurred_at>=?",
-            (agent_id, cutoff)).fetchone()["c"]
-        max_restart = svc.policy().get("restart_max_per_hour", 3)
-        if recent < max_restart:
-            from .auth import Subject, SYSTEM_SUBJECT
-            res = op_start_agent(svc, SYSTEM_SUBJECT, agent_id, None)
-            return {"crashed": True, "restarted": True,
-                    "new_instance_id": res.get("instance_id")}
+            "restart_on_exit", True):
+        return {"crashed": True, **_schedule_crash_restart(svc, agent_id)}
+    return {"crashed": True, "restarted": False}
+
+
+def _schedule_crash_restart(svc, agent_id: str) -> dict:
+    """DEF-03: schedule the auto-restart after the configured per-attempt
+    backoff — NEVER restart synchronously here. State persists in kv so a
+    daemon restart still honors backoff and the per-hour cap."""
+    import datetime
+    from .timeutil import parse_rfc3339
+    pol = svc.policy()
+    backoff = pol.get("restart_backoff") or [5, 15, 60]
+    max_restart = pol.get("restart_max_per_hour", 3)
+    now = svc.now()
+    cutoff = format_rfc3339(parse_rfc3339(now) - datetime.timedelta(hours=1))
+    recent = svc.store.conn.execute(
+        "SELECT COUNT(*) c FROM events WHERE entity_type='agent' AND "
+        "entity_id=? AND kind='agent.started' AND occurred_at>=?",
+        (agent_id, cutoff)).fetchone()["c"]
+    if recent >= max_restart:
         with svc.store.write() as cur:
             svc.store.add_event(cur, entity_type="agent", entity_id=agent_id,
                                 kind="agent.restart_limit",
                                 payload={"recent": recent})
-        return {"crashed": True, "restarted": False, "reason":
-                "RESTART_LIMIT_EXCEEDED"}
-    return {"crashed": True, "restarted": False}
+        return {"restarted": False, "reason": "RESTART_LIMIT_EXCEEDED"}
+    st = svc.store.kv_get(f"restart:{agent_id}", {}) or {}
+    attempts = int(st.get("attempts", 0)) + 1
+    step = backoff[min(attempts - 1, len(backoff) - 1)]
+    next_allowed = format_rfc3339(
+        parse_rfc3339(now) + datetime.timedelta(seconds=step))
+    svc.store.kv_set(f"restart:{agent_id}",
+                     {"attempts": attempts, "next_allowed_at": next_allowed})
+    with svc.store.write() as cur:
+        svc.store.add_event(cur, entity_type="agent", entity_id=agent_id,
+                            kind="agent.restart_scheduled",
+                            payload={"attempts": attempts, "backoff_s": step,
+                                     "next_allowed_at": next_allowed})
+    return {"restarted": False, "restart_scheduled": True,
+            "attempts": attempts, "backoff_s": step,
+            "next_allowed_at": next_allowed}
 
 
 def _fail_running_ops(cur, agent_id: str):

@@ -30,6 +30,7 @@ DEFAULT_POLICY = {
     "outbox_retry": [1, 5, 30, 120, 600],
     "outbox_max_attempts": 20,
     "rpc_body_limit": 1048576,
+    "idem_lease_seconds": 60,
     "context_bytes_limit": 524288,
     "recovery_hold": False,
 }
@@ -107,6 +108,22 @@ class Service:
     # ---------------- dispatch ----------------
     INTERNAL_ROUTES = {"producer.emit"}
 
+    # Fast ledger commands: idempotency reserve + handler + response backfill
+    # commit in ONE transaction — a crash leaves either nothing (rollback,
+    # reservation included) or everything (business effect + response).
+    IDEM_ATOMIC_PREFIXES = ("emit.", "inbox.", "producer.emit",
+                            "control.task.")
+    # Slow commands (harness calls / long operations) cannot hold the global
+    # write lock for their whole duration: they use lease-based takeover.
+    IDEM_SLOW_PREFIXES = ("control.agent.", "control.harness.",
+                          "control.test.", "control.system.",
+                          "control.operation.", "control.port.",
+                          "control.subscription.", "control.permission.",
+                          "control.producer.", "control.trigger.",
+                          "control.channel.", "control.human.",
+                          "control.event.", "control.audit.",
+                          "control.delivery.")
+
     def dispatch(self, subject: Subject, command: str, arguments: dict,
                  request_id: str | None = None) -> tuple[dict, bool]:
         """Returns (envelope_data, is_new). Raises HiveError on failure."""
@@ -129,66 +146,166 @@ class Service:
         payload_hash = canonical_hash(
             {k: v for k, v in normalized.items() if k != "request_id"})
 
-        idem_key = None
-        if not is_query and request_id:
-            idem_key = (subject.subject_id, command, request_id)
-            replay = self._idem_reserve_or_replay(idem_key, payload_hash)
-            if replay is not None:
-                return replay, False
-
         handler = self.handlers.get(command)
         if handler is None:
             raise HiveError("NOT_IMPLEMENTED", f"命令已定义但尚未实现: {command}")
         args = validate_arguments(cmd, normalized) if cmd else normalized
+
+        atomic = command.startswith(self.IDEM_ATOMIC_PREFIXES)
+        idem_key = None
+        if is_query or not request_id:
+            result = handler(self, subject, args, request_id)
+            return self._finish_dispatch(result, command, None)
+
+        idem_key = (subject.subject_id, command, request_id)
+        kill_in_tx = False
+        if atomic and self.fault_active("idem_kill_in_tx"):
+            # disarm in its OWN committed tx first: the kill below rolls
+            # back the business tx, and the disarm must survive the crash
+            self.consume_fault("idem_kill_in_tx")
+            kill_in_tx = True
+        if atomic:
+            # reserve + execute + backfill in one transaction; a concurrent
+            # same-key request serializes on the write lock and then replays
+            with self.store.write() as cur:
+                replay = self._idem_replay_check(cur, idem_key, payload_hash)
+                if replay is not None:
+                    return replay, False
+                cur.execute(
+                    "INSERT OR IGNORE INTO idempotency(subject_id,command,"
+                    "request_id,payload_hash,response,created_at,lease_until)"
+                    " VALUES (?,?,?,?,NULL,?,NULL)",
+                    (idem_key[0], idem_key[1], idem_key[2], payload_hash,
+                     format_rfc3339(now_utc())))
+                if cur.execute("SELECT changes()").fetchone()[0] != 1:
+                    # lost the insert race inside this tx — replay the winner
+                    replay = self._idem_replay_check(cur, idem_key,
+                                                     payload_hash)
+                    if replay is not None:
+                        return replay, False
+                    raise HiveError("STORAGE_UNAVAILABLE",
+                                    "同request-id占位冲突", {"retryable": True})
+                result = handler(self, subject, args, request_id)
+                if kill_in_tx:
+                    # real crash path: business rows + reservation + response
+                    # are ALL uncommitted — process death rolls everything back
+                    import os as _os
+                    _os._exit(70)
+                cur.execute(
+                    "UPDATE idempotency SET response=? WHERE subject_id=? "
+                    "AND command=? AND request_id=? AND response IS NULL",
+                    (json.dumps(result, ensure_ascii=False), *idem_key))
+            return self._finish_dispatch(result, command, idem_key)
+
+        # slow path: lease reservation, then handler outside the tx
+        replay = self._idem_reserve_leased(idem_key, payload_hash)
+        if replay is not None:
+            return replay, False
+        if self.consume_fault("idem_kill_after_reserve"):
+            # real crash path: reservation committed (own tx), handler never
+            # ran, process dies — orphan lease must later be takeable
+            import os as _os
+            _os._exit(70)
         try:
             result = handler(self, subject, args, request_id)
         except BaseException:
-            # free the reservation so a same-key retry can proceed cleanly
-            if idem_key:
-                with self.store.write() as cur:
-                    cur.execute("DELETE FROM idempotency WHERE subject_id=? "
-                                "AND command=? AND request_id=? AND response "
-                                "IS NULL", idem_key)
+            with self.store.write() as cur:
+                cur.execute("DELETE FROM idempotency WHERE subject_id=? "
+                            "AND command=? AND request_id=? AND response "
+                            "IS NULL", idem_key)
             raise
+        self._idem_store(idem_key, payload_hash, result)
+        return self._finish_dispatch(result, command, idem_key)
 
-        if idem_key:
-            self._idem_store(idem_key, payload_hash, result)
+    def _finish_dispatch(self, result, command, idem_key):
         if self.consume_fault("rpc_response_drop"):
             raise HiveError("TRANSPORT_UNAVAILABLE",
                             "响应已按故障点丢弃；请求可能已提交，请用相同request-id重试",
                             {"retryable": True})
         return result, True
 
-    def _idem_reserve_or_replay(self, key, payload_hash):
-        """Reserve the idempotency key BEFORE executing (INSERT wins the race).
-        Returns the cached response dict for a replay, or None when this
-        request owns the execution. Concurrent losers wait for the winner."""
+    def _idem_replay_check(self, cur, key, payload_hash):
+        """Inside a tx: replay if the key already carries a response."""
+        row = cur.execute(
+            "SELECT payload_hash, response FROM idempotency WHERE "
+            "subject_id=? AND command=? AND request_id=?", key).fetchone()
+        if not row:
+            return None
+        if row["payload_hash"] != payload_hash:
+            raise HiveError("IDEMPOTENCY_CONFLICT",
+                            "相同request-id但参数不同",
+                            {"request_id": key[2]})
+        if row["response"] is not None:
+            return json.loads(row["response"])
+        return None
+
+    def _idem_lease_seconds(self) -> int:
+        try:
+            return int(self.policy().get("idem_lease_seconds", 60))
+        except (TypeError, ValueError):
+            return 60
+
+    def _idem_reserve_leased(self, key, payload_hash):
+        """Slow-path reservation with a lease. Returns cached response for
+        replay, None when this request owns the execution.
+
+        Orphaned reservations (holder died before backfill) become takeable
+        once the lease expires: a same-key retry CAS-extends the lease and
+        re-executes — effect safety comes from the command itself being
+        merge-tolerant (slot-unique starts, idempotent stops)."""
         import time as _time
-        for _attempt in range(40):
+        lease = self._idem_lease_seconds()
+        deadline = _time.monotonic() + min(lease + 5, 30)
+        while True:
+            import datetime as _dt
+            now = format_rfc3339(now_utc())
+            lease_until = format_rfc3339(
+                now_utc() + _dt.timedelta(seconds=lease))
             with self.store.write() as cur:
-                cur.execute(
-                    "INSERT OR IGNORE INTO idempotency(subject_id,command,"
-                    "request_id,payload_hash,response,created_at) "
-                    "VALUES (?,?,?,?,NULL,?)",
-                    (key[0], key[1], key[2], payload_hash,
-                     format_rfc3339(now_utc())))
-                reserved = cur.execute("SELECT changes()").fetchone()[0] == 1
                 row = cur.execute(
-                    "SELECT payload_hash, response FROM idempotency "
-                    "WHERE subject_id=? AND command=? AND request_id=?",
-                    key).fetchone()
-            if row["payload_hash"] != payload_hash:
-                raise HiveError("IDEMPOTENCY_CONFLICT",
-                                "相同request-id但参数不同",
-                                {"request_id": key[2]})
-            if row["response"] is not None:
-                return json.loads(row["response"])
-            if reserved:
-                return None  # we own the execution; backfill after handler
-            _time.sleep(0.25)  # another same-key request is mid-flight
-        raise HiveError("STORAGE_UNAVAILABLE",
-                        "同request-id请求仍在执行中，请稍后用相同request-id重试",
-                        {"retryable": True})
+                    "SELECT payload_hash, response, lease_until FROM "
+                    "idempotency WHERE subject_id=? AND command=? AND "
+                    "request_id=?", key).fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO idempotency(subject_id,command,"
+                        "request_id,payload_hash,response,created_at,"
+                        "lease_until) VALUES (?,?,?,?,NULL,?,?)",
+                        (key[0], key[1], key[2], payload_hash, now,
+                         lease_until))
+                    return None
+                if row["payload_hash"] != payload_hash:
+                    raise HiveError("IDEMPOTENCY_CONFLICT",
+                                    "相同request-id但参数不同",
+                                    {"request_id": key[2]})
+                if row["response"] is not None:
+                    return json.loads(row["response"])
+                expired = (row["lease_until"] is None
+                           or row["lease_until"] <= now)
+                if expired:
+                    took = cur.execute(
+                        "UPDATE idempotency SET lease_until=? WHERE "
+                        "subject_id=? AND command=? AND request_id=? AND "
+                        "response IS NULL AND (lease_until IS NULL OR "
+                        "lease_until<=?)",
+                        (lease_until, key[0], key[1], key[2], now)).rowcount
+                    if took == 1:
+                        return None  # lease taken over by us
+            if _time.monotonic() > deadline:
+                raise HiveError("STORAGE_UNAVAILABLE",
+                                "同request-id请求仍在执行中；占位在租约到期后"
+                                "可用相同request-id接管重试",
+                                {"retryable": True,
+                                 "lease_seconds": lease})
+            _time.sleep(0.3)
+
+    def idem_startup_sweep(self):
+        """Daemon start: clear reservations whose lease expired long ago
+        (holder died before backfill). Kept rows keep the conflict check."""
+        now = format_rfc3339(now_utc())
+        with self.store.write() as cur:
+            cur.execute("DELETE FROM idempotency WHERE response IS NULL "
+                        "AND lease_until IS NOT NULL AND lease_until<?", (now,))
 
     def _idem_store(self, key, payload_hash, result):
         with self.store.write() as cur:

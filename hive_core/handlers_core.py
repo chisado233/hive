@@ -16,8 +16,7 @@ def register(svc):
     svc.register("control.system.config", h_system_config)
     svc.register("control.system.log", h_system_log)
     svc.register("control.system.backup", h_system_backup)
-    for cmd in ("control.system.restore",):
-        svc.register(cmd, _not_implemented(cmd))
+    svc.register("control.system.restore", h_system_restore_remote)
     # agents
     svc.register("control.agent.list", h_agent_list)
     svc.register("control.agent.show", h_agent_show)
@@ -76,6 +75,16 @@ def _not_implemented(cmd):
     def h(svc, subject, args, rid):
         raise HiveError("NOT_IMPLEMENTED", f"命令尚未实现: {cmd}")
     return h
+
+
+def h_system_restore_remote(svc, subject, args, rid):
+    """DEF-11.1: restore is a LOCAL offline command (DESIGN §15.2) — the
+    online route must reject clearly instead of a generic placeholder."""
+    raise HiveError(
+        "INVALID_ARGUMENT",
+        "control system restore 是本地离线命令：请在目标主机用 CLI 本地执行"
+        "（hive --home <新home> control system restore --from <备份> --into "
+        "<空目录>）；服务端不提供远程恢复", {"local_only": True})
 
 
 # ---------------- system ----------------
@@ -977,7 +986,8 @@ def h_delivery_retry(svc, subject, args, rid):
 
 # ---------------- harness ----------------
 def h_harness_list(svc, subject, args, rid):
-    svc.authz.require(subject, "harness.read") if False else None
+    svc.authz.require(subject, "system.observe",
+                      resource="harness-registry")
     rows = svc.store.conn.execute("SELECT * FROM harnesses ORDER BY name").fetchall()
     items = []
     for r in rows:

@@ -19,13 +19,57 @@ from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "cli", "hive.py")
-PORT = os.environ.get("HIVE_ACC_PORT", "29962")
-ENDPOINT = f"http://127.0.0.1:{PORT}"
 
-RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+def _pick_free_port(preferred=None):
+    """Free TCP port: preferred if free, else OS-assigned ephemeral.
+    Never reuses a port another run holds."""
+    import socket
+    if preferred is not None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", preferred))
+                return preferred
+            except OSError:
+                pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = str(_pick_free_port(int(os.environ["HIVE_ACC_PORT"]))
+           if os.environ.get("HIVE_ACC_PORT") else _pick_free_port(29962))
+ENDPOINT = f"http://127.0.0.1:{PORT}"
+# secondary ports used by individual cases, kept relative & run-unique
+PORT_B = str(_pick_free_port(int(PORT) + 1))   # AC-ENV-01 fresh home
+PORT_C = str(_pick_free_port(int(PORT) + 2))   # AC-ENV-02 prod home
+
+RUN_ID = (datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+          + "-" + os.urandom(3).hex())
 EVIDENCE_ROOT = os.path.join(ROOT, "work", "acceptance", RUN_ID)
 HOME = os.path.join(EVIDENCE_ROOT, "runtime")
 OWNER_CRED = os.path.join(HOME, "auth", "owner.json")
+
+# ---- run manifest: every managed resource of THIS run is registered here
+MANIFEST_PATH = os.path.join(EVIDENCE_ROOT, "run-manifest.json")
+MANIFEST = {"run_id": RUN_ID, "endpoint": ENDPOINT,
+            "ports": {"main": PORT, "env01_fresh": PORT_B,
+                      "env02_prod": PORT_C},
+            "home": HOME, "daemon_pids": [], "daemon_homes": [HOME],
+            "daemon_endpoints": {}, "real_harness_agents": [],
+            "zsession_handles": [], "webhook_ports": [], "cleanup_log": []}
+
+
+def manifest_save():
+    os.makedirs(EVIDENCE_ROOT, exist_ok=True)
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(MANIFEST, f, ensure_ascii=False, indent=2)
+
+
+def manifest_add(key, value):
+    if value not in MANIFEST[key]:
+        MANIFEST[key].append(value)
+    manifest_save()
 
 CASES: dict[str, callable] = {}
 _results: dict[str, dict] = {}
@@ -153,6 +197,42 @@ def new_task(actor="owner", to=None, type_="work", parent=None, extra=(),
     return env["data"]["task"]
 
 
+def run_concurrent(specs: list[dict], barrier: bool = True) -> list[dict]:
+    """Spawn real CLI subprocesses concurrently. Each spec: {argv, cred?}.
+    Every command/exit/response is recorded to commands.jsonl (DEF-06).
+    Returns per-spec {argv, exit, envelope}."""
+    procs = []
+    for spec in specs:
+        argv = [sys.executable, CLI, "--home", spec.get("home", HOME),
+                "--endpoint", spec.get("endpoint", ENDPOINT), "--format",
+                "json"]
+        if spec.get("cred"):
+            argv += ["--credential-file", spec["cred"]]
+        argv += [str(a) for a in spec["argv"]]
+        procs.append((spec, subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace")))
+    out = []
+    for spec, proc in procs:
+        stdout, _ = proc.communicate(timeout=spec.get("timeout", 90))
+        try:
+            env = json.loads(stdout)
+        except ValueError:
+            env = {"ok": False, "_stdout": stdout[:500]}
+        _record("commands", {"argv": list(spec["argv"]),
+                             "concurrent": True,
+                             "exit": proc.returncode, "at": _now(),
+                             "response_ok": env.get("ok"),
+                             "error": env.get("error"),
+                             "task_id": (env.get("data", {}).get("task")
+                                         or {}).get("task_id")
+                             or (env.get("data", {}).get("results", [{}])[0]
+                                 or {}).get("task_id")})
+        out.append({"argv": spec["argv"], "exit": proc.returncode,
+                    "envelope": env})
+    return out
+
+
 def claim_task(actor: str, task_id: str):
     env, code = H(actor, "inbox", "claim", task_id)
     if not (env.get("ok") and env["data"]["results"][0]["ok"]):
@@ -172,14 +252,18 @@ def note(msg: str):
 
 # ---------------- environment ----------------
 def setup_daemon(test_mode=True):
-    shutil.rmtree(HOME, ignore_errors=True)
+    if os.path.exists(HOME) and os.listdir(HOME):
+        raise RuntimeError(f"运行目录非空（可能与其他run冲突）: {HOME}")
     env, code = run("control", "system", "init", "--listen",
                     f"127.0.0.1:{PORT}", *(["--test-mode"] if test_mode else []))
     assert env.get("ok"), env
-    assert "token" not in json.dumps(env).lower() or True
+    assert "hvt_" not in json.dumps(env), "init stdout 不得包含凭据正文"
     env, code = run("control", "system", "start", "--listen",
                     f"127.0.0.1:{PORT}", *(["--test-mode"] if test_mode else []))
     assert env.get("ok"), env
+    pid = env.get("data", {}).get("service_pid")
+    if pid:
+        manifest_add("daemon_pids", pid)
     # health
     import urllib.request
     with urllib.request.urlopen(ENDPOINT + "/v1/health", timeout=5) as r:
@@ -188,12 +272,73 @@ def setup_daemon(test_mode=True):
     return health
 
 
+def start_aux_daemon(home: str, test_mode: bool = False) -> str:
+    """init+start an auxiliary daemon home; retries with a fresh port on the
+    pick-then-bind race. Returns its endpoint; registers in the manifest."""
+    import shutil as _sh
+    for attempt in range(3):
+        port = str(_pick_free_port(31000 + attempt * 7 + os.getpid() % 1000))
+        ep = f"http://127.0.0.1:{port}"
+        _sh.rmtree(home, ignore_errors=True)
+        env, code = run("control", "system", "init",
+                        "--listen", f"127.0.0.1:{port}", home=home)
+        if not env.get("ok"):
+            continue
+        env, code = run("control", "system", "start",
+                        "--listen", f"127.0.0.1:{port}", home=home,
+                        endpoint=ep)
+        if env.get("ok") and env.get("data", {}).get("ready"):
+            pid = env["data"].get("service_pid")
+            if pid:
+                manifest_add("daemon_pids", pid)
+            MANIFEST["daemon_homes"].append(home)
+            MANIFEST["daemon_endpoints"][home] = ep
+            manifest_save()
+            return ep
+    raise RuntimeError(f"辅助daemon启动失败: {home}")
+
+
 def teardown_daemon():
-    try:
-        owner("control", "system", "stop", "--reason", "acceptance run end")
-    except Exception:  # noqa: BLE001
-        pass
+    """Manifest-scoped cleanup: only resources THIS run created.
+
+    Order per DEF-07: managed agent instances first (real harness sessions
+    must be stopped via the ledger), then test daemons (managed stop, never
+    by process name / PID batch-kill). Everything is recorded."""
+    for agent_id in list(MANIFEST["real_harness_agents"]):
+        try:
+            env, code = owner("control", "agent", "stop", agent_id,
+                              "--reason", "run teardown: 受管实例收尾")
+            rec = {"agent": agent_id,
+                   "result": env.get("data", env.get("error"))}
+        except Exception as e:  # noqa: BLE001
+            rec = {"agent": agent_id, "error": repr(e)[:150]}
+        MANIFEST["cleanup_log"].append({"kind": "agent_stop", **rec})
+        manifest_save()
+    stopped = []
+    for home in list(MANIFEST["daemon_homes"]):
+        cred = os.path.join(home, "auth", "owner.json")
+        try:
+            env, _c = _stop_home(home, cred)
+            stopped.append({"home": home, "ok": bool(env.get("ok"))})
+        except Exception as e:  # noqa: BLE001
+            stopped.append({"home": home, "error": repr(e)[:120]})
+    MANIFEST["cleanup_log"].append({"kind": "daemon_stop", "results": stopped})
+    manifest_save()
     time.sleep(1.5)
+
+
+def _stop_home(home: str, cred: str):
+    """Managed-stop the daemon of one home (registry lookup by its own
+    service.json endpoint)."""
+    ep = ENDPOINT
+    try:
+        svc = json.load(open(os.path.join(home, "runtime", "service.json"),
+                             encoding="utf-8"))
+        ep = svc.get("endpoint") or ep
+    except (OSError, ValueError):
+        pass
+    return run("control", "system", "stop", "--reason",
+               "acceptance run end", home=home, endpoint=ep, cred=cred)
 
 
 # ---------------- AC cases: ENV ----------------
@@ -202,7 +347,7 @@ def ac_env_01():
     """全新初始化、默认隔离与重复init"""
     begin_case("AC-ENV-01")
     fresh = os.path.join(_ctx["case_dir"], "fresh-home")
-    env, code = run("control", "system", "init", "--listen", "127.0.0.1:29963",
+    env, code = run("control", "system", "init", "--listen", f"127.0.0.1:{PORT_B}",
                     home=fresh)
     expect(env, code, True)
     assert os.path.isfile(os.path.join(fresh, "system.json"))
@@ -213,7 +358,7 @@ def ac_env_01():
         return hashlib.sha256(open(p, "rb").read()).hexdigest()
     sysjson = os.path.join(fresh, "system.json")
     h1 = h(sysjson)
-    env2, code2 = run("control", "system", "init", "--listen", "127.0.0.1:29963",
+    env2, code2 = run("control", "system", "init", "--listen", f"127.0.0.1:{PORT_B}",
                       home=fresh)
     expect(env2, code2, True)
     assert env2["data"].get("already_initialized"), "重复init应返回现状"
@@ -239,17 +384,17 @@ def ac_env_02():
     expect(env, code, True)
     # non-test home rejects test commands
     prod = os.path.join(_ctx["case_dir"], "prod-home")
-    run("control", "system", "init", "--listen", "127.0.0.1:29964", home=prod)
-    run("control", "system", "start", "--listen", "127.0.0.1:29964",
-        home=prod, endpoint="http://127.0.0.1:29964")
+    prod_ep = start_aux_daemon(prod)
     env, code = run("control", "test", "seed", "--scenario", "x", "--out",
                     os.path.join(prod, "m.json"),
-                    home=prod, endpoint="http://127.0.0.1:29964",
+                    home=prod, endpoint=prod_ep,
                     cred=os.path.join(prod, "auth", "owner.json"))
     expect(env, code, False, code="TEST_ONLY")
     env, code = run("control", "system", "stop", "--reason", "env02",
-                    home=prod, endpoint="http://127.0.0.1:29964",
+                    home=prod, endpoint=prod_ep,
                     cred=os.path.join(prod, "auth", "owner.json"))
+    expect(env, code, True)
+    MANIFEST["daemon_homes"].remove(prod)  # 本case已自行受管停止
     time.sleep(1.0)
 
 
@@ -296,9 +441,28 @@ def ac_cli_01():
     n_cmds = len(schema["data"]["commands"])
     n_test = sum(1 for c in schema["data"]["commands"]
                  if c["command"].startswith("control.test"))
-    assert n_cmds == 97 - (0 if n_test else 5) or n_cmds == 97 or n_cmds == 92, \
-        f"schema命令数 {n_cmds}"
-    note(f"schema commands={n_cmds} (test={n_test})")
+    # exact per-profile assertion: this run's daemon IS the test profile, so
+    # schema must contain ALL 97 commands including the 5 test leaves
+    assert n_test == 5, f"test profile应含5个test命令，实际{n_test}"
+    assert n_cmds == 97, f"test profile schema命令数应恰为97，实际{n_cmds}"
+    # cross-check the prod profile on an aux daemon: test commands excluded
+    prod_home = os.path.join(_ctx["case_dir"], "prod-schema")
+    prod_ep = start_aux_daemon(prod_home)
+    import urllib.request as _ur
+    req2 = _ur.Request(prod_ep.rstrip("/") + "/v1/schema")
+    req2.add_header("Authorization", "Bearer " + json.load(
+        open(os.path.join(prod_home, "auth", "owner.json"),
+             encoding="utf-8"))["token"])
+    with _ur.urlopen(req2, timeout=10) as r2:
+        schema2 = json.loads(r2.read().decode())
+    n_cmds2 = len(schema2["data"]["commands"])
+    n_test2 = sum(1 for c in schema2["data"]["commands"]
+                  if c["command"].startswith("control.test"))
+    assert n_cmds2 == 92 and n_test2 == 0, (
+        f"生产profile应排除test命令(92/0)，实际{n_cmds2}/{n_test2}")
+    _stop_home(prod_home, os.path.join(prod_home, "auth", "owner.json"))
+    note(f"schema: test profile 97 (incl. 5 test), "
+         f"prod profile {n_cmds2} (0 test)")
 
 
 @case
@@ -713,9 +877,11 @@ def ac_ctx_01():
     env, code = owner("control", "test", "harness", fx["agents"]["A"],
                       "--action", "idle")
     expect(env, code, True)
-    note(f"context includes CONTEXT.md: {'ac_ctx_01' in ctx}, "
-         f"history excluded: {'history/old.md' not in ctx}, "
-         f"agent.md once: {ctx.count('# Hive Agent 系统工作协议') == 1}")
+    assert ctx.count("# Hive Agent 系统工作协议") == 1,         f"系统协议应恰好一次，实际{ctx.count('# Hive Agent 系统工作协议')}"
+    assert "个体工作说明" in ctx, "个体说明应加载"
+    assert "ac_ctx_01" in ctx and "RULES 标记" in ctx, "根目录业务md应加载"
+    assert "history/old.md" not in ctx and "不应自动加载" not in ctx,         "history 不应递归自动注入"
+    assert "STARTUP.md" not in ctx, "系统派生简报不混入业务md"
 
 
 def _fixture_state(agent_id):
@@ -956,22 +1122,15 @@ def ac_task_02():
     fx = _ctx["fx"]
     t = new_task()
     cred_a, cred_b = fx["credentials"]["A"], fx["credentials"]["B"]
-    procs = []
-    argv_base = [sys.executable, CLI, "--home", HOME, "--endpoint", ENDPOINT,
-                 "--format", "json", "inbox", "claim", t["task_id"]]
-    for i in range(20):
-        cred = cred_a if i % 2 == 0 else cred_b
-        procs.append(subprocess.Popen(argv_base + ["--credential-file", cred],
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL, text=True,
-                                      encoding="utf-8", errors="replace"))
-    outs = [p.communicate(timeout=60)[0] for p in procs]
+    results = run_concurrent(
+        [{"argv": ["inbox", "claim", t["task_id"]],
+          "cred": cred_a if i % 2 == 0 else cred_b} for i in range(20)])
     ok_items = already = rejected = 0
-    for out in outs:
+    for r0 in results:
+        env = r0["envelope"]
         try:
-            env = json.loads(out)
             r = env["data"]["results"][0]
-        except (ValueError, KeyError, IndexError):
+        except (KeyError, IndexError, TypeError):
             continue
         if r.get("ok") and r.get("already_owned"):
             already += 1
@@ -1184,20 +1343,23 @@ def ac_task_08():
         ensure_ascii=False))
     env, code = H("A", "emit", "batch", "--file", bat, "--request-id", "batch-1")
     expect(env, code, False)  # self-wait -> WAIT_CYCLE
-    env, _ = owner("control", "task", "list")
+    env, _ = owner("control", "task", "list", "--root", parent["task_id"],
+                   "--limit", "200")
     assert not any(i["title"] == "batch-child" for i in env["data"]["items"]), \
-        "batch失败不得残留半批"
+        "batch失败不得残留半批（按root过滤验证）"
     open(bat, "w", encoding="utf-8").write(json.dumps({"operations": [
         {"op": "new", "ref": "child2", "root": True,
          "task": {"target": f"port:{fx['ports']['main']}",
                   "title": "batch-child2", "body": "b"}}]}, ensure_ascii=False))
     env, code = H("A", "emit", "batch", "--file", bat, "--request-id", "batch-2")
     expect(env, code, True)
-    env, code = H("A", "emit", "batch", "--file", bat, "--request-id", "batch-2")
-    expect(env, code, True)
-    env, _ = owner("control", "task", "list")
-    assert len([i for i in env["data"]["items"]
-                if i["title"] == "batch-child2"]) == 1
+    child2_id = env["data"]["refs"]["child2"]
+    env2, code = H("A", "emit", "batch", "--file", bat, "--request-id",
+                   "batch-2")
+    expect(env2, code, True)
+    assert env2["data"]["refs"]["child2"] == child2_id, "重放返回相同ID"
+    # exact-ID verification — page-position independent
+    assert peek("owner", child2_id)["title"] == "batch-child2"
 
 
 # ---------------- AC-MSG ----------------
@@ -1886,19 +2048,15 @@ def ac_run_01():
     base = [sys.executable, CLI, "--home", HOME, "--endpoint", ENDPOINT,
             "--credential-file", OWNER_CRED, "--format", "json", "control",
             "agent", "start", fx["agents"]["C"]]
-    procs = [subprocess.Popen(base, stdout=subprocess.PIPE, text=True,
-                              encoding="utf-8", errors="replace")
-             for _ in range(20)]
-    outs = [p.communicate(timeout=60)[0] for p in procs]
+    results = run_concurrent(
+        [{"argv": ["control", "agent", "start", fx["agents"]["C"]],
+          "cred": OWNER_CRED} for _ in range(20)])
     ids = set()
-    for out in outs:
-        try:
-            d = json.loads(out)
-            iid = (d.get("data") or {}).get("instance_id")
-            if iid:
-                ids.add(iid)
-        except ValueError:
-            pass
+    for r0 in results:
+        d = r0["envelope"]
+        iid = (d.get("data") or {}).get("instance_id")
+        if iid:
+            ids.add(iid)
     note(f"20-way start: distinct instance ids = {len(ids)}")
     assert len(ids) == 1, f"唯一有效实例，实际 {ids}"
     import sqlite3
@@ -2045,7 +2203,8 @@ def ac_run_05():
     expect(env, code, True)
     env, code = owner("control", "agent", "start", fx["agents"]["A"])
     expect(env, code, True)
-    assert not env["data"].get("already_running") or True
+    assert env["data"].get("instance_id"), "stop-confirm 后可重新启动"
+    assert not env["data"].get("already_running"),         "槽位释放后应为新实例而非 already_running"
 
 
 @case
@@ -2076,32 +2235,42 @@ def ac_run_06():
 
 @case
 def ac_run_07():
+    """DEF-03 语义：崩溃→退避计划→时钟推进→触发；超限停计划；paused不拉起。"""
     begin_case("AC-RUN-07")
     fx = _ctx["fx"]
-    # confirmed crash -> auto restart per backoff policy
+    # 1) confirmed crash schedules a backoff restart (no sync restart)
     env, code = owner("control", "test", "harness", fx["agents"]["A"],
                       "--action", "crash")
     expect(env, code, True)
     ev = env["data"]["events"][0]
     note(f"crash result: {ev}")
-    assert ev.get("crashed") is True
+    assert ev.get("crashed") is True and ev.get("restart_scheduled") is True         and not ev.get("restarted"), "崩溃后只登记退避计划，不同步重启"
+    assert ev.get("backoff_s") == 5, "第一轮用 backoff[0]=5s"
     env, _ = owner("control", "agent", "show", fx["agents"]["A"], "--runtime")
-    act = env["data"]["runtime"]["active_instance"]
-    note(f"after crash: active={bool(act)}")
-    # exceed restart limit: crash repeatedly (limit 3/hour)
-    observed = []
-    for _i in range(6):
+    assert (env["data"]["runtime"]["active_instance"] or {}).get(
+        "instance_id") is None, "确认退出后立刻无实例"
+    # 2) advance past backoff window -> exactly one restart fires
+    owner("control", "test", "clock", "advance", "--by", "30s")
+    time.sleep(3)
+    env, _ = owner("control", "agent", "show", fx["agents"]["A"], "--runtime")
+    iid_r = (env["data"]["runtime"]["active_instance"] or {}).get(
+        "instance_id")
+    assert iid_r, "退避窗口后按计划拉起"
+    # 3) repeated crash+advance uses escalating backoff and stops at the cap
+    outcomes = []
+    for _i in range(4):
         env, code = owner("control", "test", "harness", fx["agents"]["A"],
                           "--action", "crash")
         expect(env, code, True)
-        observed.extend(env["data"]["events"])
-        time.sleep(0.3)
-    note(f"crash series: {json.dumps(observed, ensure_ascii=False)[:400]}")
-    assert any(e.get("reason") == "RESTART_LIMIT_EXCEEDED" or
-               (e.get("crashed") and e.get("restarted") is False)
-               for e in observed), "超限后停止自动重启"
-    # no zombie: at most one live instance at any time
-    env, _ = owner("control", "agent", "show", fx["agents"]["A"], "--runtime")
+        ev = env["data"]["events"][0]
+        outcomes.append(ev)
+        owner("control", "test", "clock", "advance", "--by", "90s")
+        time.sleep(2.5)
+    note(f"series: {json.dumps(outcomes, ensure_ascii=False)[:400]}")
+    assert any(e.get("reason") == "RESTART_LIMIT_EXCEEDED"
+               for e in outcomes), "超限后停止自动重启计划"
+    # the LAST scheduled restart attempt must not create a second instance
+    time.sleep(3)
     import sqlite3
     db = sqlite3.connect(os.path.join(HOME, "data", "hive.db"))
     live = db.execute(
@@ -2109,13 +2278,15 @@ def ac_run_07():
         "('starting','live','stopping')", (fx["agents"]["A"],)).fetchone()[0]
     db.close()
     assert live <= 1, f"无双实例，实际 {live}"
-    # paused agent: late crash event does not auto-restart
+    # 4) paused agent: late crash event does not auto-restart
     owner("control", "agent", "stop", fx["agents"]["B"], "--reason", "run07")
     env, code = owner("control", "test", "harness", fx["agents"]["B"],
                       "--action", "crash")
     expect(env, code, True)
     env, _ = owner("control", "agent", "show", fx["agents"]["B"])
     assert env["data"]["agent"]["lifecycle"] == "paused", "不自动拉起"
+    # restore A for later cases
+    owner("control", "agent", "start", fx["agents"]["A"])
 
 
 # ---------------- AC-HAR ----------------
@@ -2154,11 +2325,66 @@ def ac_har_01():
     assert env["data"]["instance_stop_result"] == "stopped"
 
 
+
+def zsession_env_preflight(timeout_s: int = 120) -> tuple[bool, str]:
+    """Probe the REAL zsession turn-execution layer: spawn a trivial session
+    and wait for a message_done event. External blocker evidence for the
+    real-harness cases — distinguishes environment from product failures."""
+    import urllib.request
+    cfg = json.load(open(os.path.expanduser(
+        "~/.zcode/zsession/config.json"), encoding="utf-8"))
+    tok = cfg["tokens"]["owner-local"]["token"]
+    base = "http://127.0.0.1:8765"
+
+    def api(method, path, body=None):
+        req = urllib.request.Request(
+            base + path,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + tok}, method=method)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+
+    try:
+        cur = api("GET", "/events?cursor=0&limit=1").get("nextCursor", 0)
+        spawn = api("POST", "/sessions/spawn", {
+            "workspace": os.environ.get("TEMP", ".").replace("\\", "/")
+            + "/zs-preflight-ws",
+            "prompt": "只回复: OK", "mode": "yolo",
+            "name": "hive-preflight",
+            "model": os.environ.get("HIVE_PREFLIGHT_MODEL",
+                                    "bigmodel-api/GLM-5.3-Flash")})
+        sid = (spawn.get("sessions") or [{}])[0].get("sessionId")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            evs = api("GET", f"/events?cursor={cur}&limit=200").get("events", [])
+            for e in evs:
+                if e.get("type") == "message_done" and sid in json.dumps(
+                        e.get("data", {})):
+                    api("POST", f"/sessions/{sid}/kill", {"force": True})
+                    return True, f"turn completed (probe {sid[:20]})"
+            time.sleep(4)
+        api("POST", f"/sessions/{sid}/kill", {"force": True}) if sid else None
+        return False, (f"no message_done within {timeout_s}s for probe "
+                       f"{sid} — ZCode turn execution layer not completing")
+    except Exception as e:  # noqa: BLE001
+        return False, f"preflight exception: {e!r:.120}"
+
+
 @case
 def ac_har_02():
     """真实harness五能力smoke（缺真实环境则Blocked）"""
     begin_case("AC-HAR-02")
     real = os.environ.get("HIVE_REAL_HARNESS")
+    if real:
+        _ok_env, _env_note = zsession_env_preflight()
+        if not _ok_env:
+            _results["AC-HAR-02"] = {"status": "Blocked",
+                                      "notes": "zsession/ZCode执行层不可用: "
+                                               + _env_note}
+            note("env preflight failed: " + _env_note)
+            raise _Blocked()
+
     if not real:
         note("未提供 HIVE_REAL_HARNESS=<name>；真实接入待验收（Blocked）")
         _results["AC-HAR-02"] = {"status": "Blocked",
@@ -2319,17 +2545,14 @@ def ac_hum_03():
     base = [sys.executable, CLI, "--home", HOME, "--endpoint", ENDPOINT,
             "--format", "json", "control", "human", "answer", q["task_id"],
             "--spec-version", "1"]
-    p1 = subprocess.Popen(base + ["--credential-file",
-                                  fx["credentials"]["human"], "--text", "答案A"],
-                          stdout=subprocess.PIPE, text=True, encoding="utf-8",
-                          errors="replace")
-    # second submitter: use owner (different actor) slightly later
-    p2 = subprocess.Popen(base + ["--credential-file", OWNER_CRED,
-                                  "--text", "答案B"],
-                          stdout=subprocess.PIPE, text=True, encoding="utf-8",
-                          errors="replace")
-    o1 = json.loads(p1.communicate()[0])
-    o2 = json.loads(p2.communicate()[0])
+    res = run_concurrent([
+        {"argv": ["control", "human", "answer", q["task_id"],
+                  "--spec-version", "1", "--text", "答案A"],
+         "cred": fx["credentials"]["human"]},
+        {"argv": ["control", "human", "answer", q["task_id"],
+                  "--spec-version", "1", "--text", "答案B"],
+         "cred": OWNER_CRED}])
+    o1, o2 = res[0]["envelope"], res[1]["envelope"]
     wins = sum(1 for o in (o1, o2) if o.get("ok"))
     note(f"concurrent answers: wins={wins}")
     assert wins == 1, (o1.get("error"), o2.get("error"))
@@ -2412,10 +2635,16 @@ def ac_prod_01():
     assert env.get("ok"), env
     t = env["data"]["task"]
     assert t["source"].get("producer"), t["source"]
-    # no agent/inbox created for producer
+    # no agent/inbox created for producer: agent count unchanged by emit
     env2, _ = owner("control", "agent", "list")
-    assert not any(a["name"].endswith("-external")
-                   for a in env2["data"]["items"][3:]) or True
+    n_before = env2["data"]["counts"]["total"]
+    env3b, _ = _producer_post(fx["credentials"]["producer"], {
+        "event_id": "evt-acc-1b", "root": True,
+        "spec": {"target": f"port:{fx['ports']['main']}",
+                 "title": "再投一单", "body": "b"}})
+    assert env3b.get("ok")
+    env2b, _ = owner("control", "agent", "list")
+    assert env2b["data"]["counts"]["total"] == n_before,         f"producer投递不得创建Agent: {n_before} -> "         f"{env2b['data']['counts']['total']}"
     # same event_id, different request: dedup
     env3, _ = _producer_post(fx["credentials"]["producer"], {
         "event_id": "evt-acc-1", "root": True,
@@ -2655,9 +2884,14 @@ def ac_prod_05():
                 break
         assert env["data"]["items"][0]["state"] == "sent"
         ids = [b.get("delivery_id") for b in received["bodies"]]
-        assert len(ids) == len(set(ids)) or True
         same = [i for i in ids if i == dlv]
-        note(f"delivery_id {dlv} seen {len(same)} times (接收端可去重)")
+        assert len(same) >= 1, "同delivery_id至少到达一次"
+        env_d, _ = owner("control", "delivery", "list", "--task", t["task_id"])
+        d_rows = [i for i in env_d["data"]["items"]
+                  if i["kind"] == "webhook"]
+        assert len(d_rows) == 1, f"账本只有一条webhook投递: {len(d_rows)}"
+        note(f"delivery_id {dlv} seen {len(same)} times; "
+             f"ledger rows={len(d_rows)}")
         # channel disabled: result stays, done not flipped to fail
         owner("control", "channel", "disable", "prod05hook", "--reason", "p5")
         t2 = new_task(extra=["--callback", f"port:{ext}"])
@@ -2770,11 +3004,22 @@ def ac_sched_04():
     expect(env, code, True)
     assert len(env["data"]["items"]) >= 1, "产生unclaimed事件"
     assert peek("owner", t["task_id"])["state"] == "queued", "不自毁"
-    # new authorized subscriber can still claim
-    env, code = owner("control", "permission", "grant", "--file",
-                      os.path.join(_ctx["case_dir"], "g.json"), "--reason",
-                      "s4") if False else ({"ok": False}, 0)
-    claim_task("A", t["task_id"]) if False else None
+    # add a new authorized subscriber: it gets notified and can claim
+    env, code = owner("control", "agent", "create", "--name", "S4-late",
+                      "--harness", "fixture-minimal", cred=None)         if False else owner("control", "agent", "create", "--name",
+                            "S4-late", "--harness", "fixture-minimal")
+    expect(env, code, True)
+    s4 = env["data"]["agent"]["agent_id"]
+    owner("control", "subscription", "add", "--agent", s4, "--port",
+          fx["ports"]["main"], "--reason", "s4新订阅者")
+    g = os.path.join(_ctx["case_dir"], "g.json")
+    open(g, "w", encoding="utf-8").write(json.dumps({
+        "subject": f"agent:{s4}",
+        "actions": ["task.claim", "task.read"],
+        "resources": [f"port:{fx['ports']['main']}"]}, ensure_ascii=False))
+    env, code = owner("control", "permission", "grant", "--file", g,
+                      "--reason", "s4")
+    expect(env, code, True)
     env, _ = H("A", "inbox", "list", "--view", "available",
                "--include-declined")
     assert t["task_id"] in [i["task_id"] for i in env["data"]["items"]], \
@@ -2929,27 +3174,31 @@ def ac_rec_04():
     env, _ = owner("control", "task", "list", "--type", "receipt")
     assert len([i for i in env["data"]["items"]
                 if i["reply_to"] == t["task_id"]]) == 1, "事件重放不复制回执"
-    # old instance crash event doesn't affect new instance
+    # late old-generation crash (REAL path): crash generation N (its backoff
+    # schedule persists), then start generation N+1 — stale schedule/events
+    # of gen N must not stop or duplicate the new instance
     env, _ = owner("control", "agent", "show", fx["agents"]["A"], "--runtime")
     old_iid = env["data"]["runtime"]["active_instance"]["instance_id"]
-    owner("control", "agent", "restart", fx["agents"]["A"], "--reason", "rec04")
-    # inject crash for old generation via test harness action on old id: the
-    # action targets agent's live instance only, so simulate by direct event
-    import sqlite3
-    db = sqlite3.connect(os.path.join(HOME, "data", "hive.db"))
-    db.execute(
-        "INSERT INTO events(event_id,entity_type,entity_id,entity_version,kind,"
-        "occurred_at,recorded_at,actor,payload) VALUES "
-        "(?,'agent',?,1,'agent.crashed',?,?,?,?)",
-        ("evt_late_" + old_iid[-8:], fx["agents"]["A"], _now(), _now(),
-         "test:late", "{}"))
-    db.commit()
-    db.close()
-    time.sleep(2.5)
+    env, code = owner("control", "test", "harness", fx["agents"]["A"],
+                      "--action", "crash")
+    expect(env, code, True)
+    ev = env["data"]["events"][0]
+    assert ev.get("crashed") and ev.get("restart_scheduled"), ev
+    owner("control", "agent", "start", fx["agents"]["A"])  # generation N+1
+    time.sleep(3)
     env, _ = owner("control", "agent", "show", fx["agents"]["A"], "--runtime")
     inst = env["data"]["runtime"]["active_instance"]
-    assert inst and inst["instance_id"] != old_iid and \
-        inst["phase"] == "live", "旧代次事件不覆盖新实例"
+    assert inst and inst["instance_id"] != old_iid and         inst["phase"] == "live", "旧代次事件不覆盖新实例"
+    # stale restart schedule must not create a SECOND live instance
+    owner("control", "test", "clock", "advance", "--by", "10m")
+    time.sleep(3)
+    import sqlite3
+    db = sqlite3.connect(os.path.join(HOME, "data", "hive.db"))
+    live = db.execute(
+        "SELECT COUNT(*) FROM instances WHERE agent_id=? AND phase IN "
+        "('starting','live','stopping')", (fx["agents"]["A"],)).fetchone()[0]
+    db.close()
+    assert live == 1, f"过期退避计划不得双开实例 live={live}"
 
 
 @case
@@ -3227,9 +3476,12 @@ def ac_store_01():
     H("B", "emit", "done", t["task_id"], "--claim", cl["claim_id"],
       "--text", "x")
     owner("emit", "comment", t["task_id"], "--text", "c")
-    H("A", "inbox", "wait", "create",
-      new_task(to=f"agent:{fx['agents']['A']}")["task_id"], "--on",
-      f"task:{t['task_id']}") if False else None
+    wp = new_task(to=f"agent:{fx['agents']['A']}")
+    claim_task("A", wp["task_id"])
+    env, code = H("A", "inbox", "wait", "create", wp["task_id"], "--on",
+                  f"task:{t['task_id']}")
+    expect(env, code, True)
+    assert env["data"]["wait"]["wait_id"].startswith("wtt_")
     env, code = owner("control", "system", "status")
     expect(env, code, True)
     # unique indexes exist
@@ -3262,22 +3514,16 @@ def ac_store_02():
     begin_case("AC-STORE-02")
     import subprocess
     fx = _ctx["fx"]
-    argv = [sys.executable, CLI, "--home", HOME, "--endpoint", ENDPOINT,
-            "--credential-file", fx["credentials"]["A"], "--format", "json",
-            "emit", "new", "--root", "--to", f"port:{fx['ports']['main']}",
-            "--title", "幂等任务", "--body", "x", "--request-id", "idem-1"]
-    procs = [subprocess.Popen(argv, stdout=subprocess.PIPE, text=True,
-                              encoding="utf-8", errors="replace")
-             for _ in range(20)]
-    outs = [p.communicate()[0] for p in procs]
+    results = run_concurrent(
+        [{"argv": ["emit", "new", "--root", "--to",
+                   f"port:{fx['ports']['main']}", "--title", "幂等任务",
+                   "--body", "x", "--request-id", "idem-1"],
+          "cred": fx["credentials"]["A"]} for _ in range(20)])
     ids = set()
-    for out in outs:
-        try:
-            env = json.loads(out)
-            if env.get("ok"):
-                ids.add(env["data"]["task"]["task_id"])
-        except ValueError:
-            pass
+    for r0 in results:
+        env = r0["envelope"]
+        if env.get("ok"):
+            ids.add(env["data"]["task"]["task_id"])
     note(f"20 same-key creates: distinct tasks={len(ids)}")
     assert len(ids) == 1, ids
     # same key different content -> conflict
@@ -3396,10 +3642,13 @@ def ac_e2e_01():
     env, code = H("B", "emit", "done", child, "--claim", clb["claim_id"],
                   "--text", "资料完成")
     expect(env, code, True)
-    # A got comment notice + receipt; wait ready
+    # A got the @-comment notice (notice with comment_id-shaped reply_to)
     env, _ = H("A", "inbox", "list", "--view", "personal", "--type", "notice")
-    assert any(i["reply_to"] and "cmt" not in i["reply_to"]
-               for i in env["data"]["items"]) or True
+    notices = [i for i in env["data"]["items"]
+               if (i.get("reply_to") or "").startswith("cmt_")]
+    assert notices, "A应收到@评论notice"
+    nd = notices[0]["data"]
+    assert nd.get("task_id") == child, "notice指向子任务评论"
     # A asks human via emit + wait
     hspec = os.path.join(_ctx["case_dir"], "h.json")
     open(hspec, "w", encoding="utf-8").write(json.dumps({
@@ -3455,6 +3704,15 @@ def ac_e2e_02():
     """真实最小harness端到端与可替换实例"""
     begin_case("AC-E2E-02")
     real = os.environ.get("HIVE_REAL_HARNESS")
+    if real:
+        _ok_env, _env_note = zsession_env_preflight()
+        if not _ok_env:
+            _results["AC-E2E-02"] = {"status": "Blocked",
+                                      "notes": "zsession/ZCode执行层不可用: "
+                                               + _env_note}
+            note("env preflight failed: " + _env_note)
+            raise _Blocked()
+
     if not real:
         note("未提供 HIVE_REAL_HARNESS；真实端到端待验收（Blocked）")
         _results["AC-E2E-02"] = {"status": "Blocked",
@@ -3542,6 +3800,162 @@ def ac_e2e_02():
     if st["state"] != "done" or not os.path.isfile(out):
         raise AssertionError(
             f"真实任务未完成: state={st['state']} output={os.path.isfile(out)}")
+
+
+@case
+def ac_e2e_03():
+    """任务中途换实例续作（真实 ZCode / zcode-zsession）。
+
+    1. 实例1领取任务（责任建立）。
+    2. 实例1产生 checkpoint 文件，独立读取并核对内容。
+    3. 任务仍非终态时停止实例1。
+    4. 同agent_id启动新实例，旧实例凭据失效。
+    5. 新实例依据checkpoint续作，产生最终文件。
+    6. 新实例通过Hive提交done。
+    7. 对照实例/账本/文件/日志证明连续性。
+    """
+    begin_case("AC-E2E-03")
+    real = os.environ.get("HIVE_REAL_HARNESS")
+    if real:
+        _ok_env, _env_note = zsession_env_preflight()
+        if not _ok_env:
+            _results["AC-E2E-03"] = {"status": "Blocked",
+                                      "notes": "zsession/ZCode执行层不可用: "
+                                               + _env_note}
+            note("env preflight failed: " + _env_note)
+            raise _Blocked()
+
+    if not real:
+        note("未提供 HIVE_REAL_HARNESS；真实续作待验收（Blocked）")
+        _results["AC-E2E-03"] = {"status": "Blocked",
+                                 "notes": "缺少真实harness环境"}
+        raise _Blocked()
+    spec_hint = os.environ.get("HIVE_REAL_HARNESS_SPEC")
+    if spec_hint and os.path.isfile(spec_hint):
+        env, code = owner("control", "harness", "register", "--file",
+                          spec_hint, "--replace", "--reason", "e2e03接入")
+        expect(env, code, True)
+    import tempfile
+    d = _ctx["case_dir"]
+    ws = os.path.join(tempfile.gettempdir(), f"hive-e2e03-ws-{RUN_ID}")
+    os.makedirs(ws, exist_ok=True)
+    # phase inputs for the real agent
+    open(os.path.join(ws, "input.txt"), "w", encoding="utf-8").write(
+        "Hive续作输入：编号E2E03。\n")
+    cfgf = os.path.join(d, "agent.json")
+    open(cfgf, "w", encoding="utf-8").write(json.dumps({
+        "name": "e2e03-real", "runtime": {"harness": real},
+        "workspace": {"path": ws}}, ensure_ascii=False))
+    env, code = owner("control", "agent", "create", "--file", cfgf)
+    expect(env, code, True)
+    agent_id = env["data"]["agent"]["agent_id"]
+    MANIFEST["real_harness_agents"].append(agent_id)
+    manifest_save()
+    # ---- phase 1 task + claim by instance 1 (the real agent itself)
+    env, code = owner("emit", "new", "--root", "--to", f"agent:{agent_id}",
+                      "--type", "work", "--title", "两阶段续作任务",
+                      "--body",
+                      "第一阶段：读取 input.txt；领取本任务；把一行检查点写入 "
+                      "CHECKPOINT.md（内容含 E2E03 与你的实例ID）。"
+                      "完成后等待后续指令，不要结束任务。")
+    expect(env, code, True)
+    task_id = env["data"]["task"]["task_id"]
+    # cold start: wait for instance up + credential issued, then drive it
+    # with the phase-1 instruction containing the exact claim command
+    iid1 = None
+    cred1 = None
+    _dl = time.time() + 120
+    while time.time() < _dl and not iid1:
+        env2, _ = owner("control", "agent", "show", agent_id, "--runtime")
+        iid1 = (env2["data"]["runtime"]["active_instance"] or {}).get(
+            "instance_id")
+        if iid1:
+            cred1 = os.path.join(HOME, "runtime", "credentials",
+                                 f"{iid1}.json")
+            if os.path.isfile(cred1):
+                break
+            iid1 = None
+        time.sleep(5)
+    assert iid1 and os.path.isfile(cred1), "实例1启动并发行凭据"
+    msg0 = (f"请先领取你的个人任务 {task_id}：执行 python \"{CLI}\" "
+            f"--home \"{HOME}\" --endpoint {ENDPOINT} --credential-file "
+            f"\"{cred1}\" inbox claim {task_id}；随后执行第一阶段："
+            f"读取工位 input.txt，把检查点写入 CHECKPOINT.md —— 一行文本，"
+            f"必须包含 E2E03 和实例ID {iid1}。不要结束任务，不要写 "
+            f"RESULT.md。")
+    env, code = owner("control", "agent", "send", agent_id, "--text", msg0,
+                      "--reason", "e2e03第一阶段驱动", timeout=300)
+    expect(env, code, True)
+    # wait for the real claim + checkpoint, all produced by instance 1
+    claimed = False
+    cp = os.path.join(ws, "CHECKPOINT.md")
+    deadline = time.time() + 420
+    cp_ok = False
+    while time.time() < deadline:
+        env, _ = owner("control", "task", "show", task_id)
+        if not claimed and env["data"]["task"]["state"] == "claimed":
+            claimed = True
+        if os.path.isfile(cp):
+            content = open(cp, encoding="utf-8", errors="replace").read()
+            if "E2E03" in content and iid1 in content:
+                cp_ok = True
+        if claimed and cp_ok:
+            break
+        time.sleep(8)
+    assert claimed,         f"实例1必须真实领取任务，实际 {env['data']['task']['state']}"
+    assert cp_ok, (f"实例1必须真实生成含E2E03+实例ID的CHECKPOINT.md，"
+                   f"实际内容: "
+                   f"{open(cp, encoding='utf-8', errors='replace').read()[:120]!r}"
+                   if os.path.isfile(cp) else "实例1未生成CHECKPOINT.md")
+    note(f"checkpoint by instance1: "
+         f"{open(cp, encoding='utf-8', errors='replace').read()[:80]!r}")
+    # ---- phase 3 task still non-terminal; stop instance 1
+    env, _ = owner("control", "task", "show", task_id)
+    assert env["data"]["task"]["state"] == "claimed", "停止前任务必须非终态"
+    env, code = owner("control", "agent", "stop", agent_id, "--reason",
+                      "e2e03换实例")
+    expect(env, code, True)
+    # ---- phase 4 new instance same agent_id; old creds fenced
+    env, code = owner("control", "agent", "start", agent_id)
+    expect(env, code, True)
+    iid2 = env["data"]["instance_id"]
+    assert iid2 and iid2 != iid1, "唯一新实例"
+    env, code = run("control", "system", "status", cred=cred1)
+    assert not env.get("ok") and env["error"]["code"] in (
+        "INSTANCE_FENCED", "TOKEN_REVOKED"), "旧实例凭据失效"
+    cred2 = os.path.join(HOME, "runtime", "credentials", f"{iid2}.json")
+    assert os.path.isfile(cred2)
+    # ---- phase 5 instance 2 continues: final file from checkpoint
+    msg2 = (f"你是该任务的新实例（旧实例 {iid1} 已停止）。读取工位 "
+            f"CHECKPOINT.md 续作第二阶段：把最终结果写入 RESULT.md —— "
+            f"内容一行，包含 E2E03、原实例ID {iid1} 和新实例ID {iid2}。"
+            f"然后领取/确认任务 {task_id} 并用 emit done 结束"
+            f"（凭据文件 {cred2}）。")
+    env, code = owner("control", "agent", "send", agent_id, "--text", msg2,
+                      "--reason", "e2e03第二阶段", timeout=300)
+    expect(env, code, True)
+    res = os.path.join(ws, "RESULT.md")
+    deadline = time.time() + 480
+    done = False
+    while time.time() < deadline:
+        env, _ = owner("control", "task", "show", task_id)
+        if env["data"]["task"]["state"] in ("done", "fail", "trash"):
+            done = True
+            break
+        time.sleep(10)
+    # ---- phase 6/7 verdicts on ledger + files + continuity
+    st = env["data"]["task"]
+    assert done and st["state"] == "done",         f"新实例必须通过Hive提交done，实际 {st['state']}"
+    assert st["result"]["ended_by"] == f"agent:{agent_id}"
+    assert os.path.isfile(res), "实例2必须真实生成RESULT.md"
+    rcontent = open(res, encoding="utf-8", errors="replace").read()
+    assert "E2E03" in rcontent and iid1 in rcontent and iid2 in rcontent,         f"RESULT.md必须引用两个实例ID: {rcontent[:120]!r}"
+    assert os.path.isfile(cp), "实例1的checkpoint在换实例后保留"
+    note(f"continuity: task={task_id} i1={iid1} i2={iid2} "
+         f"checkpoint+result both on disk; ended_by={st['result']['ended_by']}")
+    # managed cleanup of the real agent
+    owner("control", "agent", "stop", agent_id, "--reason", "e2e03收尾")
+
 
 
 # ---------------- main ----------------

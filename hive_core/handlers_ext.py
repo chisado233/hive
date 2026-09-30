@@ -41,7 +41,8 @@ def _producer_card(r) -> dict:
 
 
 def h_producer_list(svc, subject, args, rid):
-    svc.authz.require(subject, "producer.manage") if False else None
+    svc.authz.require(subject, "producer.manage",
+                      resource="producer-registry")
     rows = svc.store.conn.execute("SELECT * FROM producers ORDER BY created_at, "
                                   "producer_id").fetchall()
     items = [_producer_card(r) for r in rows]
@@ -191,7 +192,8 @@ def h_producer_revoke(svc, subject, args, rid):
 
 # ---------------- trigger ----------------
 def h_trigger_list(svc, subject, args, rid):
-    svc.authz.require(subject, "trigger.manage") if False else None
+    svc.authz.require(subject, "trigger.manage",
+                      resource="trigger-registry")
     sql = "SELECT * FROM triggers WHERE 1=1"
     params: list = []
     if args.get("enabled") is not None:
@@ -346,6 +348,8 @@ def _channel_card(r) -> dict:
 
 
 def h_channel_list(svc, subject, args, rid):
+    svc.authz.require(subject, "channel.manage",
+                      resource="channel-registry")
     rows = svc.store.conn.execute("SELECT * FROM channels ORDER BY name").fetchall()
     items = [_channel_card(r) for r in rows]
     limit = args.get("limit") or 50

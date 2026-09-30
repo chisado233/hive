@@ -34,9 +34,6 @@ def register(svc):
 def _inbox_agent(args, subject):
     if args.get("agent") and args["agent"] != subject.subject_id and \
             subject.subject_type not in ("owner", "system"):
-        from .agents import get_agent_subject
-        target = get_agent_subject(svc=None, agent_id=args["agent"]) if False \
-            else args["agent"]
         # viewing another agent's inbox requires authorization
         raise HiveError("FORBIDDEN", "查看他人inbox需要授权（--agent 不改变调用身份）")
     return args.get("agent") or subject.subject_id
@@ -380,7 +377,7 @@ def h_producer_emit(svc, subject, args, rid):
                                        "urgency": spec.get("urgency", "normal"),
                                        "claim_within": spec.get("claim_within"),
                                        "expires_in": spec.get("expires_in"),
-                                       **({"spec": spec} if False else {})}, rid)
+}, rid)
     if event_id:
         payload_hash = hashlib.sha256(json.dumps(
             spec, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

@@ -693,7 +693,8 @@ COMMANDS: list[Command] = [
             "tx_before_commit", "rpc_response_drop", "outbox_after_commit",
             "notification_drop", "harness_start_after_launch", "harness_stop_unknown",
             "config_after_publish", "event_duplicate", "event_reorder",
-            "operation_before_execute"]),
+            "operation_before_execute", "idem_kill_in_tx",
+            "idem_kill_after_reserve"]),
         P("mode", kind="enum", choices=["once", "always"], default="once"),
         P("value", kind="json", default={}),
     ]),
@@ -702,7 +703,8 @@ COMMANDS: list[Command] = [
             "tx_before_commit", "rpc_response_drop", "outbox_after_commit",
             "notification_drop", "harness_start_after_launch", "harness_stop_unknown",
             "config_after_publish", "event_duplicate", "event_reorder",
-            "operation_before_execute"]),
+            "operation_before_execute", "idem_kill_in_tx",
+            "idem_kill_after_reserve"]),
     ]),
     C("CMD-097", "control test harness", [
         P("agent", positional=True, required=True, help="仅fixture adapter"),
@@ -846,9 +848,8 @@ def validate_arguments(cmd: Command, args: dict) -> dict:
 
 
 def schema_export(test_mode: bool = False) -> dict:
-    cmds = [c.to_schema() for c in COMMANDS]
-    if not test_mode:
-        cmds = [c for c in cmds if not c.path[1] == "test"]
+    cmds = [c.to_schema() for c in COMMANDS if test_mode
+            or c.path[1] != "test"]
     return {
         "protocol_version": "1",
         "commands": cmds,

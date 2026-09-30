@@ -116,7 +116,9 @@ def require_task_visible(svc, subject, task_id: str):
 
 def visible_tasks(svc, subject):
     """All task rows the subject may read (used by control task list)."""
-    rows = svc.store.conn.execute("SELECT * FROM tasks ORDER BY task_id").fetchall()
+    rows = svc.store.conn.execute(
+        "SELECT * FROM tasks ORDER BY datetime(created_at) DESC, task_id"
+    ).fetchall()
     return [r for r in rows if can_read_task(svc, subject, r)]
 
 

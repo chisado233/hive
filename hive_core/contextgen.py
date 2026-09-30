@@ -89,7 +89,11 @@ def gather_context(svc, agent_id: str, cfg: dict) -> dict:
     if not ws or not os.path.isdir(ws):
         result["workspace_missing"] = ws
         return result
-    exclude = set(cfg.get("workspace", {}).get("exclude", ["agent.md", "prompt.md"]))
+    exclude = set(cfg.get("workspace", {}).get("exclude",
+                                                ["agent.md", "prompt.md"]))
+    # system-derived runtime brief: never business context even if a legacy
+    # copy from an older version exists in the root (DEF-02)
+    exclude.add("STARTUP.md")
     pattern = cfg.get("workspace", {}).get("context_glob", "*.md")
     names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ws, pattern))
                    if os.path.isfile(p) and os.path.basename(p) not in exclude)

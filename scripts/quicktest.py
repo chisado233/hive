@@ -2,12 +2,28 @@
 import json
 import os
 import subprocess
+import time
 import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "cli", "hive.py")
-PORT = "29972"
+
+
+def _free_port(preferred=29972):
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = os.environ.get("HIVE_QUICK_PORT") or str(_free_port())
 
 
 def run(home, *args, cred=None, expect_ok=True):
@@ -30,7 +46,11 @@ def run(home, *args, cred=None, expect_ok=True):
 
 
 def main():
-    home = os.path.join(ROOT, "tmp", "quicktest-home")
+    # unique per-run home: never wipes a directory another run is using
+    home = os.path.join(ROOT, "tmp", f"quicktest-{PORT}")
+    if os.path.exists(home) and os.listdir(home):
+        home = os.path.join(ROOT, "tmp",
+                            f"quicktest-{int(time.time())}-{os.getpid()}")
     import shutil
     shutil.rmtree(home, ignore_errors=True)
     run(home, "control", "system", "init", "--listen", f"127.0.0.1:{PORT}",

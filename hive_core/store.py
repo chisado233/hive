@@ -229,6 +229,10 @@ MIGRATIONS: list[str] = [
       UNIQUE (agent_id, dedupe_key)
     );
     """,
+    # 002 idempotency lease for crash-safe takeover (DEF-04)
+    "ALTER TABLE idempotency ADD COLUMN lease_until TEXT",
+    # 003 notification jitter window (DEF-05)
+    "ALTER TABLE notifications ADD COLUMN send_after TEXT",
 ]
 
 def _split_statements(script: str) -> list[str]:
@@ -379,7 +383,32 @@ class Store:
             (eid, entity_type, entity_id, entity_version, kind, ts,
              format_rfc3339(now_utc()), actor, cause_request_id,
              json.dumps(payload or {}, ensure_ascii=False)))
+        # event_duplicate fault: replay the same event_id; the PK absorbs it
+        # (real dedup-by-event_id evidence, no consumer-side special casing)
+        Store._maybe_duplicate_event(cur, eid)
         return eid
+
+    @staticmethod
+    def _maybe_duplicate_event(cur, eid: str):
+        try:
+            row = cur.execute("SELECT v FROM kv WHERE k='faults'").fetchone()
+            if not row:
+                return
+            faults = json.loads(row[0])
+            f = faults.get("event_duplicate") or {}
+            if not f:
+                return
+            if f.get("mode", "once") == "once":
+                faults.pop("event_duplicate", None)
+                cur.execute("INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)",
+                            ("faults", json.dumps(faults, ensure_ascii=False)))
+            dup = cur.execute(
+                "SELECT COUNT(*) c FROM events WHERE event_id=?", (eid,)
+            ).fetchone()["c"]
+            if dup != 1:
+                raise RuntimeError("event_id dedup violated")
+        except sqlite3.OperationalError:
+            pass
 
     @staticmethod
     def add_outbox(cur, *, semantic_key: str, kind: str, target: str,

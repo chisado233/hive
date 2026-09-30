@@ -119,7 +119,29 @@ def get_agent_subject(svc, agent_id: str) -> str | None:
 
 
 def _workspace_root(svc, agent_id: str) -> str:
+    """Default workspace location; NEVER used when cfg sets workspace.path."""
     return os.path.join(svc.home, "workspaces", agent_id)
+
+
+def resolve_workspace(svc, agent_id: str, cfg: dict) -> str:
+    """Single source of truth for the effective workspace (DEF-01):
+    config workspace.path (already absolute at create/update) else default."""
+    path = (cfg.get("workspace") or {}).get("path")
+    if path:
+        return path
+    return _workspace_root(svc, agent_id)
+
+
+def _workspace_in_use(svc, agent_id: str, path: str) -> str | None:
+    """Another agent bound to the same workspace? (shared-root overwrite
+    guard: system derived files must not clobber each other)."""
+    for row in svc.store.conn.execute(
+            "SELECT agent_id, workspace_path FROM agents WHERE agent_id<>?",
+            (agent_id,)):
+        other = row["workspace_path"]
+        if other and os.path.abspath(other) == os.path.abspath(path):
+            return row["agent_id"]
+    return None
 
 
 def _publish_config(svc, cur, agent_id: str, cfg: dict, base_revision: int,
@@ -192,7 +214,7 @@ def _publish_config(svc, cur, agent_id: str, cfg: dict, base_revision: int,
 
 
 def _rebuild_workspace(svc, agent_id: str, cfg: dict, revision: int):
-    ws = _workspace_root(svc, agent_id)
+    ws = resolve_workspace(svc, agent_id, cfg)
     os.makedirs(os.path.join(ws, "history"), exist_ok=True)
     # system protocol
     from .contextgen import render_agent_md, render_prompt_md
@@ -227,6 +249,12 @@ def create_agent(svc, subject, args, rid) -> dict:
     agent_id = new_id("agent")
     ws_path = cfg["workspace"]["path"] or _workspace_root(svc, agent_id)
     cfg["workspace"]["path"] = os.path.abspath(ws_path)
+    clash = _workspace_in_use(svc, agent_id, cfg["workspace"]["path"])
+    if clash:
+        raise HiveError("INVALID_ARGUMENT",
+                        f"工位已被 agent {clash} 使用，不能共享覆盖系统派生文件",
+                        {"workspace": cfg["workspace"]["path"],
+                         "bound_to": clash})
     now = format_rfc3339(now_utc())
     with svc.store.write() as cur:
         cur.execute("INSERT INTO agents(agent_id,name,lifecycle,current_revision,"
@@ -270,6 +298,10 @@ def clone_agent(svc, subject, args, rid) -> dict:
     agent_id = new_id("agent")
     cfg["workspace"]["path"] = cfg["workspace"]["path"] or _workspace_root(svc,
                                                                            agent_id)
+    clash = _workspace_in_use(svc, agent_id, cfg["workspace"]["path"])
+    if clash:
+        # 克隆不复制工位：同一路径会互相覆盖系统派生文件
+        cfg["workspace"]["path"] = _workspace_root(svc, agent_id)
     now = format_rfc3339(now_utc())
     with svc.store.write() as cur:
         cur.execute("INSERT INTO agents(agent_id,name,lifecycle,current_revision,"
@@ -311,6 +343,14 @@ def update_agent(svc, subject, args, rid) -> dict:
         new_cfg = merged
     if "agent_id" in patch:
         raise HiveError("INVALID_ARGUMENT", "agent_id 不可指定")
+    new_ws = ((new_cfg.get("workspace") or {}).get("path"))
+    cur_ws = ((current.get("workspace") or {}).get("path"))
+    if new_ws and (not cur_ws or os.path.abspath(new_ws) !=
+                   os.path.abspath(cur_ws)):
+        clash = _workspace_in_use(svc, row["agent_id"], new_ws)
+        if clash:
+            raise HiveError("INVALID_ARGUMENT",
+                            f"工位已被 agent {clash} 使用", {"bound_to": clash})
     # permissions changes need grant scope
     if patch.get("permissions"):
         from .auth import can_grant

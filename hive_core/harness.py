@@ -99,6 +99,9 @@ class ProcessAdapter:
                 a = a.replace("{workspace}", options.get("workspace") or ".")
             if "{startup_file}" in a:
                 a = a.replace("{startup_file}", options.get("startup_file") or "")
+            elif "STARTUP.md" in a and options.get("startup_file"):
+                # legacy specs referencing the bare name get the runtime path
+                a = a.replace("STARTUP.md", options["startup_file"])
             out.append(a)
         return out
 
@@ -360,12 +363,12 @@ class Registry:
         return proc_result
 
     def send(self, svc, agent_id: str, harness: str, handle: str, message: str,
-             delivery_id: str) -> str:
+             delivery_id: str, mode: str = "queue") -> str:
         kind, spec = self.adapter_for(harness)
         if kind == "fixture":
             return FixtureAdapter.send(svc, agent_id, handle, message, delivery_id)
         if kind == "zsession":
-            return ZSessionAdapter.send(spec, handle, message)
+            return ZSessionAdapter.send(spec, handle, message, mode=mode)
         if spec.get("send_mode") == "stdin":
             return ProcessAdapter.send_stdin(svc, handle, message)
         if spec.get("send_mode") == "argv" and spec.get("send_argv"):
@@ -466,7 +469,8 @@ def validate_harness(svc, subject, args, rid) -> dict:
 
     test_agent = f"smoke-{new_id('agent')[4:10]}"
     test_id = new_id("agent")
-    kind = registry.get_spec(name).get("adapter")
+    spec_for_smoke = registry.get_spec(name)
+    kind = spec_for_smoke.get("adapter")
     # 1) start
     handle = None
     try:
@@ -487,17 +491,48 @@ def validate_harness(svc, subject, args, rid) -> dict:
                        "evidence": f"send={st}"})
     else:
         checks.append({"capability": "send", "passed": False, "evidence": "no handle"})
-    # 3) yolo (options were passed with yolo=True; process adapters may log it)
-    checks.append({"capability": "yolo", "passed": True,
-                   "evidence": "started with yolo=True"})
-    # 4) model switch via stop+start
+    # 3) yolo — verified by session readback when the adapter supports it
+    #    (zsession), otherwise by the launch configuration actually used
+    yolo_ev = "started with yolo=True"
+    yolo_ok = True
+    if handle and handle.startswith("sess:"):
+        try:
+            info = ZSessionAdapter._req(spec_for_smoke, "GET",
+                                        f"/sessions/{handle[5:]}")
+            sess = info.get("session") or info
+            mode = sess.get("mode") or (sess.get("meta") or {}).get("mode")
+            if mode:
+                yolo_ok = (str(mode).lower() in ("yolo", "full", "*"))
+                yolo_ev = f"session mode readback={mode}"
+            else:
+                yolo_ev = "session readback lacks mode field; "                           "launched with yolo=True"
+        except Exception as e:  # noqa: BLE001
+            yolo_ev = f"readback failed ({e!r:.60}); launched with yolo=True"
+    checks.append({"capability": "yolo", "passed": yolo_ok,
+                   "evidence": yolo_ev})
+    # 4) model switch via stop+start, verified by session readback (model
+    #    field) when available
     if handle:
         registry.stop(svc, test_id, name, handle, "smoke")
         res2 = registry.start(svc, test_id, name,
                               {"model": alt, "yolo": True, "workspace": workspace})
-        checks.append({"capability": "model_at_start", "passed": bool(res2.get("handle")),
-                       "evidence": f"restarted with model={alt}"})
-        handle = res2.get("handle")
+        handle2 = res2.get("handle")
+        ev = f"restarted with model={alt}"
+        ok4 = bool(handle2)
+        if handle2 and handle2.startswith("sess:"):
+            try:
+                info2 = ZSessionAdapter._req(spec_for_smoke, "GET",
+                                             f"/sessions/{handle2[5:]}")
+                m2 = ((info2.get("session") or info2).get("model") or {})
+                actual = m2.get("modelId") or m2.get("id") or ""
+                if actual:
+                    ok4 = actual.lower() == alt.split("/")[-1].lower()
+                    ev = f"session model readback={actual} (want {alt})"
+            except Exception as e:  # noqa: BLE001
+                ev += f"; readback failed ({e!r:.60})"
+        checks.append({"capability": "model_at_start", "passed": ok4,
+                       "evidence": ev})
+        handle = handle2
     else:
         checks.append({"capability": "model_at_start", "passed": False,
                        "evidence": "no handle"})
