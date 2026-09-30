@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hive 蜂群指挥台</title>
+<link rel="stylesheet" href="/ui/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>⬡</text></svg>">
+</head>
+<body>
+<div id="app" class="app hidden">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">⬡</span>
+      <span class="brand-name">HIVE</span>
+      <span class="brand-sub">蜂群指挥台</span>
+    </div>
+    <div class="project-picker" id="project-picker"></div>
+    <div class="topbar-spacer"></div>
+    <div class="conn" id="conn" title="连接状态">
+      <span class="conn-dot"></span><span class="conn-text">连接中</span>
+      <span class="conn-time" id="conn-time"></span>
+    </div>
+    <button class="inbox-entry" id="inbox-entry" title="人类收件箱">
+      <span class="inbox-icon">✉</span> 收件箱
+      <span class="badge hidden" id="inbox-badge"></span>
+    </button>
+    <div class="user-chip" id="user-chip"></div>
+    <button class="btn btn-ghost btn-sm" id="logout-btn">退出</button>
+  </header>
+
+  <div class="main">
+    <aside class="sidenav" id="sidenav">
+      <div class="sidenav-section">
+        <div class="sidenav-title">项目导航</div>
+        <div id="nav-projects"></div>
+      </div>
+      <div class="sidenav-section">
+        <div class="sidenav-title">视图</div>
+        <div class="seg" id="edge-mode">
+          <button class="seg-btn active" data-mode="flows">当前任务</button>
+          <button class="seg-btn" data-mode="structure">结构关系</button>
+        </div>
+      </div>
+      <div class="sidenav-section flex1">
+        <div class="sidenav-title">节点</div>
+        <div id="nav-nodes" class="nav-nodes"></div>
+      </div>
+      <div class="sidenav-section">
+        <button class="btn btn-ghost btn-sm" id="layout-reset">恢复自动布局</button>
+      </div>
+    </aside>
+
+    <section class="canvas-wrap" id="canvas-wrap">
+      <svg id="graph" tabindex="0" aria-label="项目星图"></svg>
+      <div class="graph-hint" id="graph-hint">拖动节点调整布局 · 滚轮缩放 · 点击节点查看详情</div>
+      <div class="graph-toolbar">
+        <button class="btn btn-ghost btn-sm" id="zoom-fit">适配视图</button>
+      </div>
+    </section>
+
+    <aside class="detail" id="detail">
+      <div class="detail-empty" id="detail-empty">
+        <div class="detail-empty-mark">⬡</div>
+        <p>选择图中的 Agent、资产库或任务线<br>或打开右上角收件箱</p>
+      </div>
+      <div class="detail-body hidden" id="detail-body"></div>
+    </aside>
+  </div>
+
+  <footer class="eventband collapsed" id="eventband">
+    <button class="eventband-toggle" id="eventband-toggle">
+      <span class="eb-arrow">▸</span> 事件带 <span class="eb-count" id="eb-count"></span>
+    </button>
+    <div class="eventband-list" id="eventband-list"></div>
+  </footer>
+</div>
+
+<div id="login" class="login hidden">
+  <div class="login-card">
+    <div class="brand login-brand"><span class="brand-mark">⬡</span><span class="brand-name">HIVE</span></div>
+    <h1>蜂群指挥台</h1>
+    <p class="login-desc">粘贴 Hive 凭据 token 登录（owner 或 human 凭据，来自 <code>.hive/auth/</code> 凭据文件）。凭据只用于建立本次会话，不会写入浏览器存储。</p>
+    <textarea id="login-token" class="login-input" rows="3" spellcheck="false"
+      placeholder="hvt_…"></textarea>
+    <div class="login-err hidden" id="login-err"></div>
+    <button class="btn btn-primary login-btn" id="login-btn">登 录</button>
+    <p class="login-note" id="login-note"></p>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+
+<script type="module" src="/ui/js/main.js"></script>
+</body>
+</html>

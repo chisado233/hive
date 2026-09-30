@@ -174,6 +174,14 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
             _finish_op(svc, cur, op_id, "failed", error=e.to_dict())
         raise
     warnings = [f"上下文额外入口缺失: {m}" for m in missing] if missing else []
+    # execution_root (runtime.options.execution_root): the host session
+    # runs in a shared project root while workspace.path stays the agent's
+    # private workstation (config/derived files/context/uniqueness are
+    # still keyed to the workstation). No execution_root -> legacy
+    # behaviour unchanged.
+    rt_opts = cfg.get("runtime", {}).get("options") or {}
+    workstation = cfg.get("workspace", {}).get("path")
+    execution_root = rt_opts.get("execution_root")
     registry = svc.harnesses
     enriched_context = None
     startup_file_path = None
@@ -203,7 +211,10 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
                     f"- 本实例凭据文件: {_cred_file}\n"
                     f"- 用法示例: python \"{_cli}\" --home \"{svc.home}\" "
                     f"--endpoint http://{_listen} --credential-file "
-                    f"\"{_cred_file}\" inbox list\n")
+                    f"\"{_cred_file}\" inbox list\n"
+                    f"- PROJECT_ROOT（会话运行根目录/实际cwd）: "
+                    f"{execution_root or wsdir}\n"
+                    f"- WORKSTATION_ROOT（本Agent独立工位）: {wsdir}\n")
                 # DEF-02: the brief is a per-instance runtime artifact — it
                 # lives under home/runtime/startups/, never in the business
                 # workspace, so business-md scanning can never re-ingest it
@@ -218,12 +229,17 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
         os.makedirs(cred_dir, exist_ok=True)
         start_options = {
             "model": model, "yolo": bool(cfg.get("runtime", {}).get("yolo", True)),
-            "workspace": cfg.get("workspace", {}).get("path"),
+            "workspace": execution_root or workstation,
+            "workstation_path": workstation,
             "startup_context": context,
             "credential_file_hint": os.path.join(cred_dir, f"{instance_id}.json"),
             "log_path": os.path.join(svc.home, "logs",
                                      f"instance-{agent_id}-{instance_id}.log"),
         }
+        if execution_root:
+            start_options["execution_root"] = execution_root
+        if rt_opts.get("session_name"):
+            start_options["session_name"] = rt_opts["session_name"]
         if enriched_context is not None:
             start_options["startup_context"] = enriched_context
         if startup_file_path is not None:

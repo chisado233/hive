@@ -10,7 +10,7 @@ _PREFIXES = {
     "producer": "prd_", "trigger": "trg_", "channel": "chn_", "subject": "subj_",
     "grant": "gnt_", "claim": "clm_", "request": "req_", "delivery": "dlv_",
     "audit": "aud_", "view": "view_", "decline": "dcl_", "transfer": "xfr_",
-    "credential": "crd_", "backup": "bkp_",
+    "credential": "crd_", "backup": "bkp_", "file": "file_",
 }
 
 

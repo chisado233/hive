@@ -415,7 +415,12 @@ class Registry:
             if vrow:
                 try:
                     with open(vrow["file_path"], encoding="utf-8") as f:
-                        cwd = _json.load(f).get("workspace", {}).get("path")
+                        _cfg = _json.load(f)
+                    # send cwd follows the start cwd: execution_root when set
+                    # (runtime.options), else the workstation path
+                    cwd = ((_cfg.get("runtime") or {}).get("options") or {}
+                           ).get("execution_root") or \
+                        (_cfg.get("workspace") or {}).get("path")
                 except (OSError, ValueError):
                     cwd = None
             return ProcessAdapter.send_argv(svc, handle, message, spec, cwd=cwd)

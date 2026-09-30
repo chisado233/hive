@@ -20,6 +20,8 @@ from .store import open_store
 
 def make_handler(service: Service):
     logger = service.logger
+    from .webui import WebUI
+    webui = WebUI(service)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -84,6 +86,8 @@ def make_handler(service: Service):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             try:
+                if path == "/ui" or path.startswith("/ui/"):
+                    return webui.handle_get(self, parsed)
                 if path == "/v1/health":
                     return self._send(200, {"ok": True, "ready": True,
                                             "version": __version__,
@@ -118,6 +122,13 @@ def make_handler(service: Service):
             path = parsed.path
             request_id = new_id("request")
             try:
+                if path.startswith("/ui/api/"):
+                    length = int(self.headers.get("Content-Length") or 0)
+                    cap = 1024 * 1024 * 1024  # hard ceiling for any /ui body
+                    if length > cap:
+                        raise HiveError("INVALID_ARGUMENT", "请求体过大")
+                    body = self.rfile.read(length) if length > 0 else b""
+                    return webui.handle_post(self, parsed, body)
                 if path == "/v1/commands":
                     body = self._body()
                     request_id = self._idem_header(body) or request_id
