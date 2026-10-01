@@ -455,11 +455,18 @@ class AcpBridge:
             "_meta": meta}, timeout=24 * 3600)
 
     def cancel_turn(self, binding: dict, turn_id: str | None = None):
-        # session/cancel 是请求：确认送达上游；轮次取消以 prompt 返回
-        # stopReason=cancelled / input_state 通知为准
-        self.call("session/cancel", {"sessionId": binding["session_id"],
-                                     "_meta": {"zsession": {"turnId": turn_id}}})
+        """DEF-08：session/cancel 按官方规范是无 id 通知，不等响应。
+        「取消完成」以 prompt 返回 cancelled / input_state 通知为准。"""
+        self._notify("session/cancel", {"sessionId": binding["session_id"],
+                                        "_meta": {"zsession": {"turnId": turn_id}}})
         return {"cancel_requested": True}
+
+    def answer_permission(self, request_id, answer: dict):
+        """DEF-11：上游 request_permission 桥接未实现（ACP_INTEGRATION §2）——
+        如实返回不支持，不假成功。"""
+        raise HiveError("NOT_IMPLEMENTED",
+                        "上游尚未桥接工具权限请求（request_permission），"
+                        "无法送达答复；yolo 会话由授权策略自动处理")
 
 
 EXT = "_zsession"

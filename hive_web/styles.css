@@ -729,3 +729,14 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 .md tr:hover td { background: rgba(255,255,255,.02); }
 .md a { text-decoration: underline dotted; text-underline-offset: 3px; font-weight: 500; }
 .md a:hover { text-decoration-style: solid; }
+
+/* 登录密码行 */
+.login-secret-row { display: flex; gap: 8px; align-items: center; }
+.login-secret-row .login-input { flex: 1; padding: 10px 12px; }
+
+/* SSE 流状态条 */
+.conv-stream-state {
+  padding: 5px 14px; font-size: 11.5px; color: var(--amber-hi);
+  background: var(--amber-dim); border-top: 1px solid rgba(233,191,114,.25);
+  flex: none;
+}

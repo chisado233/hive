@@ -297,6 +297,13 @@ MIGRATIONS: list[str] = [
     CREATE INDEX idx_conv_events_session ON conv_events(session_id, cursor);
     CREATE INDEX idx_conv_events_agent ON conv_events(agent_id, cursor);
     """,
+    # 007 FIFO 序号（DEF-12）：秒级 created_at + 随机 id 无法保证并发 FIFO；
+    # seq 由事务内单调计数器（kv conv_input_seq）分配。历史行按 rowid 回填。
+    """
+    ALTER TABLE conv_inputs ADD COLUMN seq INTEGER;
+    UPDATE conv_inputs SET seq = rowid WHERE seq IS NULL;
+    CREATE INDEX idx_conv_inputs_fifo ON conv_inputs(agent_id, state, seq);
+    """,
 ]
 
 def _split_statements(script: str) -> list[str]:

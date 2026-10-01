@@ -1137,18 +1137,21 @@ class WebUI:
                                     "data": {"cancelled": False,
                                              "note": "当前没有活动轮次"}})
                 return True
-            conv.set_input_state(self.svc, active["input_id"], "cancelled")
+            # DEF-18：先标 cancelling（不直接 cancelled）；桥失败回滚 running
+            conv.set_input_state(self.svc, active["input_id"], "cancelling")
             bridge = getattr(self.svc, "conversation", None)
             if bridge:
                 try:
                     bridge.bridge.cancel_turn(binding, active["turn_id"])
                 except HiveError as e:
+                    conv.set_input_state(self.svc, active["input_id"], "running")
                     self._json(h, 200, {"ok": True, "request_id": rid,
                                         "data": {"cancelled": False,
                                                  "upstream_error": e.message}})
                     return True
+            # 终态由 prompt 返回 cancelled / input_state 通知落定（不抢先）
             self._json(h, 200, {"ok": True, "request_id": rid,
-                                "data": {"cancelled": True,
+                                "data": {"cancelling": True,
                                          "input_id": active["input_id"]}})
             return True
         if sub == "/permission":
@@ -1156,8 +1159,18 @@ class WebUI:
             bridge = getattr(self.svc, "conversation", None)
             req_id = data.get("request_id")
             answer = data.get("answer") or {}
-            if bridge and hasattr(bridge.bridge, "answer_permission"):
-                bridge.bridge.answer_permission(req_id, answer)
+            # DEF-11：答复必须真实送达原生待决请求；桥无通道时明确失败
+            fn = getattr(getattr(bridge, "bridge", None), "answer_permission", None)
+            if not callable(fn):
+                raise HiveError(
+                    "NOT_IMPLEMENTED",
+                    "当前桥不支持权限答复（上游 request_permission 未桥接）")
+            # 校验：请求必须真实存在且未决、属于该 Agent
+            pend = conv.pending_permission(self.svc, agent_id)
+            if not pend or (pend.get("payload") or {}).get("request_id") != req_id:
+                raise HiveError("NOT_FOUND",
+                                "权限请求不存在/已答复/已过期，不能授权")
+            fn(req_id, answer)
             self._json(h, 200, {"ok": True, "request_id": rid,
                                 "data": {"answered": True}})
             return True

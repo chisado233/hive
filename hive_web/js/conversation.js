@@ -88,7 +88,7 @@ export class ConversationPane {
   destroy() {
     this.destroyed = true;
     this.cache.scrollTop = this.flow ? this.flow.scrollTop : null;
-    if (this.es) { this.es.close(); this.es = null; }
+    this._closeStream();
   }
 
   // ---------------- 历史投影 ----------------
@@ -356,22 +356,61 @@ export class ConversationPane {
 
   // ---------------- 流式连接 ----------------
   _connectStream() {
-    if (this.es) this.es.close();
+    this._closeStream();
     const url = `/ui/api/agent/${this.agentId}/conversation/stream?after=${this.cache.cursor || 0}`;
     this.es = new EventSource(url);
+    this._streamState("connecting");
+    this._lastBeat = Date.now();
+    this._beatTimer = setInterval(() => {
+      // 25s 无心跳即视为断开（服务端 15s 心跳）
+      if (Date.now() - this._lastBeat > 25000) this._streamState("stalled");
+    }, 5000);
+    this.es.onopen = () => this._streamState("live");
     const kinds = ["user.message", "agent.delta", "agent.message.final",
       "agent.thought", "tool.call", "turn.started", "turn.completed",
       "turn.failed", "turn.cancelled", "permission.request", "system.note"];
     for (const k of kinds) {
       this.es.addEventListener(k, (e) => {
         if (this.destroyed) return;
+        this._lastBeat = Date.now();
+        this._streamState("live");
         const ev = JSON.parse(e.data);
         if (ev.cursor) this.cache.cursor = ev.cursor;
         this._projectEvent(ev);
       });
     }
-    this.es.addEventListener("heartbeat", () => {});
-    this.es.onerror = () => { /* EventSource 自动重连；恢复时 after=cursor */ };
+    this.es.addEventListener("heartbeat", () => {
+      this._lastBeat = Date.now();
+      this._streamState("live");
+    });
+    this.es.onerror = () => {
+      // EventSource 会自动重连（带 Last-Event-ID）；显示降级状态。
+      // 若服务端 401（会话过期/撤销），轮询层会触发 auth-lost 统一进登录页。
+      if (this.es.readyState === EventSource.CLOSED) this._streamState("closed");
+      else this._streamState("reconnecting");
+    };
+  }
+
+  _closeStream() {
+    if (this.es) { this.es.close(); this.es = null; }
+    if (this._beatTimer) { clearInterval(this._beatTimer); this._beatTimer = null; }
+  }
+
+  _streamState(state) {
+    let bar = this.host.querySelector(".conv-stream-state");
+    if (!bar) {
+      bar = el("div", { class: "conv-stream-state" });
+      this.host.append(bar);
+    }
+    const map = {
+      connecting: null, live: null,
+      reconnecting: "⟳ 实时连接中断，正在重连…",
+      stalled: "⟳ 实时通道无心跳（>25s），正在重连…",
+      closed: "✕ 实时通道已关闭——刷新面板恢复",
+    };
+    const text = map[state];
+    bar.classList.toggle("hidden", !text);
+    if (text) bar.textContent = text;
   }
 
   _projectEvent(ev) {

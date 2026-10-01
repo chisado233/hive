@@ -299,6 +299,8 @@ def run_daemon(home: str, listen: str, test_mode: bool, log_level: str) -> dict:
     print(json.dumps(ready, ensure_ascii=False), flush=True)
     logger.info("daemon.ready", pid=os.getpid(), endpoint=ready["endpoint"])
     service.idem_startup_sweep()  # DEF-04: clear orphaned reservations
+    from .conversation import startup_sweep as _conv_sweep
+    _conv_sweep(service)            # DEF-10: dispatched/running → outcome_unknown
     service.scheduler.start()
     httpd.timeout = 0.5
     try:

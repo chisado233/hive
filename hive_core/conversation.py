@@ -18,7 +18,7 @@ from .ids import new_id
 from .timeutil import format_rfc3339, now_utc
 
 INPUT_STATES = ("queued", "dispatched", "running", "completed",
-                "cancelled", "failed", "outcome_unknown")
+                "cancelled", "failed", "outcome_unknown", "cancelling")
 EVENT_RETENTION = 5000          # per session ring; older → explicit gap
 HISTORY_PAGE_MAX = 200
 
@@ -190,8 +190,8 @@ def enqueue_input(svc, subject, *, agent_id: str, text: str, mode: str,
                   attachments: list | None = None,
                   instance_id: str | None = None,
                   generation: int | None = None) -> dict:
-    """持久入队（幂等：request_id 唯一约束 + 内容比对）。同一 Agent 的
-    wake 类输入按未派发合并；用户消息绝不合并。"""
+    """持久入队（幂等：(agent_id,request_id) 唯一 + 内容比对）。
+    FIFO 由事务内单调 seq 保证（kv conv_input_seq），不依赖时间戳精度。"""
     if mode not in ("queue", "interrupt"):
         raise HiveError("INVALID_ARGUMENT", "mode 必须是 queue/interrupt")
     if kind == "user" and not (text or "").strip() and not attachments:
@@ -217,15 +217,19 @@ def enqueue_input(svc, subject, *, agent_id: str, text: str, mode: str,
                 return {"input": input_card(pending), "coalesced": True}
         binding = get_binding(svc, agent_id)
         iid = new_id("input")
+        row = cur.execute("SELECT v FROM kv WHERE k='conv_input_seq'").fetchone()
+        seq = int(row[0]) + 1 if row else 1
+        cur.execute("INSERT OR REPLACE INTO kv(k,v) VALUES('conv_input_seq',?)",
+                    (str(seq),))
         cur.execute(
             "INSERT INTO conv_inputs(input_id, request_id, agent_id,"
             " instance_id, generation, session_id, mode, kind, text,"
-            " attachments, state, created_by, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " attachments, state, created_by, created_at, seq)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (iid, request_id, agent_id, inst["instance_id"], inst["generation"],
              binding and binding["session_id"], mode, kind, text,
              json.dumps(attachments or [], ensure_ascii=False), "queued",
-             subject.ref if subject else None, now))
+             subject.ref if subject else None, now, seq))
     return {"input": input_card(svc.store.conn.execute(
         "SELECT * FROM conv_inputs WHERE input_id=?", (iid,)).fetchone()),
         "replayed": False}
@@ -247,9 +251,26 @@ def set_input_state(svc, input_id: str, state: str, **fields):
         if k in fields:
             sets.append(f"{k}=?"); params.append(fields[k])
     params.append(input_id)
+    # 终态不被迟到的相反终态覆盖（cancelled↔completed 竞态防护）
+    guard = (" AND state NOT IN ('completed','cancelled','failed')"
+             if state in end_states else "")
     with svc.store.write() as cur:
         cur.execute(f"UPDATE conv_inputs SET {', '.join(sets)}"
-                    " WHERE input_id=?", params)
+                    f" WHERE input_id=?{guard}", params)
+
+
+def startup_sweep(svc):
+    """daemon 启动：dispatched/running/cancelling 输入的上游轮次在重启后无法
+    确认——如实标记 outcome_unknown（不重发、不抢占仍可能运行的旧轮次；
+    后续 queued 输入靠上游 -32011 忙冲突自然让行）。"""
+    now = svc.now()
+    with svc.store.write() as cur:
+        n = cur.execute(
+            "UPDATE conv_inputs SET state='outcome_unknown', ended_at=?,"
+            " error='daemon 重启，轮次结果未知（未重发）' WHERE state IN"
+            " ('dispatched','running','cancelling')", (now,)).rowcount
+    if n:
+        svc.logger.warning("conv.startup_sweep", count=n)
 
 
 def list_inputs(svc, agent_id: str, limit: int = 50) -> list[dict]:
@@ -262,7 +283,7 @@ def list_inputs(svc, agent_id: str, limit: int = 50) -> list[dict]:
 def next_queued(svc, agent_id: str):
     return svc.store.conn.execute(
         "SELECT * FROM conv_inputs WHERE agent_id=? AND state='queued'"
-        " ORDER BY created_at, input_id LIMIT 1", (agent_id,)).fetchone()
+        " ORDER BY seq, created_at, input_id LIMIT 1", (agent_id,)).fetchone()
 
 
 def active_input(svc, agent_id: str):

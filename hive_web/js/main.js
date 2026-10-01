@@ -31,16 +31,21 @@ function showLogin(msg = "") {
   $("#login-note").textContent = "";
   $("#login-err").classList.toggle("hidden", !msg);
   $("#login-err").textContent = msg;
+  const input = $("#login-token");
+  input.value = "";                        // 登录卡出现时清空残留（DEF-19）
+  $("#login-show").onclick = () => {
+    input.type = input.type === "password" ? "text" : "password";
+  };
   const btn = $("#login-btn");
   btn.onclick = async () => {
-    const token = $("#login-token").value.trim();
+    const token = input.value.trim();
     if (!token) return;
     btn.disabled = true;
     try {
       const r = await api.login(token);
+      input.value = "";                    // 提交后立即清空 secret
       store.me = r.subject;
       $("#login").classList.add("hidden");
-      $("#login-token").value = "";
       enterApp();
     } catch (e) {
       showLogin(errText(e));
@@ -48,8 +53,8 @@ function showLogin(msg = "") {
       btn.disabled = false;
     }
   };
-  $("#login-token").onkeydown = (e) => {
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) btn.click();
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") btn.click();
   };
 }
 

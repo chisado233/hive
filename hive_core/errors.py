@@ -41,6 +41,12 @@ ERROR_TABLE = {
     "RECLAIM_REQUIRED": (5, 409),
     "RESPONSIBILITY_BLOCKED": (5, 409),
     "OP_NOT_CANCELLABLE": (5, 409),
+    "STALE_INSTANCE": (5, 409),
+    "NO_LIVE_INSTANCE": (5, 409),
+    "NO_BINDING": (5, 409),
+    "UPSTREAM_UNSUPPORTED": (8, 422),
+    "UPSTREAM_ERROR": (8, 502),
+    "UPSTREAM_TIMEOUT": (7, 504),
     "HARNESS_BUSY": (8, 409),
     "RUNTIME_OUTCOME_UNKNOWN": (7, 503),
     "STORAGE_UNAVAILABLE": (8, 503),
@@ -66,6 +72,7 @@ class HiveError(Exception):
         default_retry = self.code in (
             "RUNTIME_OUTCOME_UNKNOWN", "TRANSPORT_UNAVAILABLE", "STORAGE_UNAVAILABLE",
             "HARNESS_BUSY", "SERVICE_UNAVAILABLE", "HARNESS_UNAVAILABLE",
+            "UPSTREAM_TIMEOUT",
         )
         self.retryable = default_retry if retryable is None else retryable
 
