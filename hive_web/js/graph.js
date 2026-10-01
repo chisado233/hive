@@ -13,7 +13,7 @@ function s(tag, attrs = {}) {
 const LINE_ORDER = ["coordinator", "research", "skill-test", "evolution", "production"];
 const LINE_LABEL = {
   coordinator: "项目负责人", research: "研究节点", "skill-test": "Skill 测试入库线",
-  evolution: "反馈进化线", production: "正式生产线",
+  evolution: "反馈进化线", production: "正式生产线", other: "其他节点",
 };
 const ROLE_ORDER = { coordinator: 0, researcher: 0, maker: 1, reviewer: 2 };
 
@@ -51,9 +51,9 @@ export class Graph {
         markerWidth="6" markerHeight="6" orient="auto-start-reverse">
         <path d="M0,0 L10,5 L0,9 z" fill="#e9bf72"></path></marker>
       <radialGradient id="star-core" cx="42%" cy="40%" r="72%">
-        <stop offset="0%" stop-color="#1b2c4e"></stop>
-        <stop offset="62%" stop-color="#101b33"></stop>
-        <stop offset="100%" stop-color="#0c1529"></stop>
+        <stop offset="0%" stop-color="#1d2c3d"></stop>
+        <stop offset="62%" stop-color="#121f2e"></stop>
+        <stop offset="100%" stop-color="#0d1622"></stop>
       </radialGradient>
       <radialGradient id="star-halo">
         <stop offset="0%" stop-color="rgba(122,221,240,0.20)"></stop>
@@ -260,18 +260,18 @@ export class Graph {
   }
 
   _nodeColors(node) {
-    if (node.kind === "human") return { ring: "#e9bf72", halo: "rgba(233,191,114," };
-    if (node.kind === "asset") return { ring: "#a99ae0", halo: "rgba(169,154,224," };
-    if (node.kind === "port") return { ring: "#28406b", halo: "rgba(122,221,240," };
+    if (node.kind === "human") return { ring: "#d8bb86" };
+    if (node.kind === "asset") return { ring: "#b3a9cf" };
+    if (node.kind === "port") return { ring: "#3a4a63" };
     const a = node.data;
-    if (a.lifecycle === "paused") return { ring: "#6b7c99", halo: "rgba(153,170,195," };
-    if (a.lifecycle === "retiring") return { ring: "#e0a06c", halo: "rgba(224,160,108," };
+    if (a.lifecycle === "paused") return { ring: "#7c8798" };
+    if (a.lifecycle === "retiring") return { ring: "#d8a086" };
     if (a.instance_count > 0) {
-      if (a.observation === "busy") return { ring: "#7addf0", halo: "rgba(122,221,240," };
-      if (a.observation === "idle") return { ring: "#6fd3a7", halo: "rgba(111,211,167," };
-      return { ring: "#e9bf72", halo: "rgba(233,191,114," };   // live 但观测未知
+      if (a.observation === "busy") return { ring: "#9fced0" };
+      if (a.observation === "idle") return { ring: "#93c9a8" };
+      return { ring: "#d8bb86" };   // live 但观测未知
     }
-    return { ring: "#49597a", halo: "rgba(107,124,153," };      // 无实例：低亮
+    return { ring: "#57637a" };     // 无实例：低亮
   }
 
   _shortName(a) {
@@ -394,12 +394,12 @@ export class Graph {
     if (cls === "asset-read") return { stroke: "#8f83c9", w: 1, dash: "3 6", marker: "arr-dim" };
     if (cls === "callback") {
       const failed = states.has("fail");
-      return { stroke: failed ? "#da6060" : "#57b389", w: 1.4, dash: "6 4",
+      return { stroke: failed ? "#e9a09b" : "#93c9a8", w: 1.4, dash: "6 4",
                marker: failed ? "arr-dim" : "arr-dim" };
     }
     // flow
-    if (states.has("claimed")) return { stroke: "#e5a33c", w: 1.8, dash: null, marker: "arr-amber" };
-    return { stroke: "#43c6d8", w: 1.6, dash: null, marker: "arr-cyan" };
+    if (states.has("claimed")) return { stroke: "#d8bb86", w: 1.8, dash: null, marker: "arr-amber" };
+    return { stroke: "#9fced0", w: 1.6, dash: null, marker: "arr-cyan" };
   }
 
   _renderEdges(edges) {

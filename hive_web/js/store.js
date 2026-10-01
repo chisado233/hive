@@ -24,7 +24,17 @@ export const store = {
 };
 
 export function onChange(fn) { store.listeners.add(fn); return () => store.listeners.delete(fn); }
-function emit(what) { for (const fn of store.listeners) fn(what); }
+function emit(what) {
+  for (const fn of store.listeners) {
+    try { fn(what); } catch (e) {
+      console.error("[hive] listener error on", what, e);
+      window.__hiveLastListenerError = String(e && e.stack || e);
+    }
+  }
+}
+
+// 调试探针：控制台可读当前状态
+window.__hiveStore = store;
 
 // ---------------- 轮询 ----------------
 let pollTimer = null, backoff = 0, polling = false;
@@ -141,17 +151,12 @@ export function projectAgents(key) {
 // 连接状态渲染
 export function renderConn() {
   const conn = document.getElementById("conn");
+  if (!conn) return;
   const txt = conn.querySelector(".conn-text");
-  const time = document.getElementById("conn-time");
   conn.classList.toggle("online", store.online === true);
   conn.classList.toggle("offline", store.online === false);
-  txt.textContent = store.online === true ? "已连接" :
+  if (txt) txt.textContent = store.online === true ? "已连接" :
     store.online === false ? "连接中断，重试中" : "连接中";
-  time.textContent = store.lastUpdate ? "更新于 " + fmtAgo(store.lastUpdate.toISOString()) : "";
-  if (store.online) setTimeout(renderConnTimeOnly, 1000);
-}
-function renderConnTimeOnly() {
-  const time = document.getElementById("conn-time");
-  if (time && store.lastUpdate)
-    time.textContent = "更新于 " + fmtAgo(store.lastUpdate.toISOString());
+  conn.title = store.lastUpdate
+    ? "更新于 " + fmtAgo(store.lastUpdate.toISOString()) : "";
 }

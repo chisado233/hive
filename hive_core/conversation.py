@@ -297,7 +297,15 @@ def pending_permission(svc, agent_id: str):
     r = svc.store.conn.execute(
         "SELECT * FROM conv_events WHERE agent_id=? AND type='permission.request' "
         "ORDER BY cursor DESC LIMIT 1", (agent_id,)).fetchone()
-    return _ev_card(r) if r else None
+    if not r:
+        return None
+    req_id = json.loads(r["payload"]).get("request_id")
+    # 已有答复/超时解除的不再是待决
+    done = svc.store.conn.execute(
+        "SELECT 1 FROM conv_events WHERE agent_id=? AND"
+        " type='permission.resolved' AND json_extract(payload,'$.request_id')=?"
+        " LIMIT 1", (agent_id, req_id)).fetchone()
+    return None if done else _ev_card(r)
 
 
 # ------------------------------------------------------------- projections

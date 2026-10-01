@@ -133,8 +133,40 @@ def fetch_session_state(svc, session_id: str) -> dict:
             "archived": bool(d.get("archivedAt"))}
 
 
+def _history_via_api(svc, session_id: str, limit: int) -> dict:
+    """上游 /sessions/:id/history（DEF-14 修复后）：message+part 直读、
+    分页游标 seq。返回按序文本消息（工具行不在此表，经实时事件获得）。"""
+    data = _get(svc, f"/sessions/{session_id}/history?limit={limit}")
+    items = data.get("items") or []
+    # part 按 messageSeq 聚合（partSeq 顺序拼接）
+    msgs: dict[int, dict] = {}
+    for it in items:
+        ms = it.get("messageSeq", it.get("seq", 0))
+        m = msgs.setdefault(ms, {"role": it.get("role"), "parts": []})
+        m["parts"].append((it.get("partSeq") or 0, it.get("text") or ""))
+    out = []
+    for ms in sorted(msgs):
+        m = msgs[ms]
+        text = "".join(t for _, t in sorted(m["parts"]))
+        kind = {"user": "user", "assistant": "assistant"}.get(m["role"])
+        if not kind or not text.strip():
+            continue
+        out.append({"kind": kind, "text": text, "state": "completed",
+                    "at": None, "source": "history"})
+    total = data.get("count", len(items))
+    truncated = bool(data.get("oldestSeq") and data["oldestSeq"] > 1) or \
+        len(items) >= limit
+    return {"messages": out,
+            "note": "存在更早历史（分页游标可继续翻）" if truncated else None,
+            "count": len(out)}
+
+
 def fetch_session_history(svc, session_id: str, limit: int = 3000) -> dict:
-    """优先磁盘全量日志（带 mtime 缓存），缺失时退回 daemon 内存环。"""
+    """优先上游会话级分页历史；失败回退磁盘事件日志（含工具行）。"""
+    try:
+        return _history_via_api(svc, session_id, limit)
+    except HiveError:
+        pass
     if os.path.exists(EVENTS_FILE):
         st = os.stat(EVENTS_FILE)
         cached = _history_cache.get(session_id)
@@ -146,9 +178,7 @@ def fetch_session_history(svc, session_id: str, limit: int = 3000) -> dict:
         _history_cache[session_id] = (st.st_size, st.st_mtime, messages)
         if len(_history_cache) > 40:
             _history_cache.pop(next(iter(_history_cache)))
-        return {"messages": messages,
-                "note": None if messages else None,
-                "count": len(messages)}
+        return {"messages": messages, "note": None, "count": len(messages)}
     # 兜底：daemon 内存环
     data = _get(svc, f"/events?cursor=0&limit={limit}")
     events = data.get("events") or []

@@ -9,9 +9,9 @@ const STAR_LAYERS = [
   { density: 0.000014, rMin: 1.2, rMax: 2.2, alpha: 1.0, twinkle: 1 },    // 近层（少量闪烁）
 ];
 const NEBULAE = [
-  { hue: "#182A50", r: 0.42, speed: 90000, phase: 0.0, ax: 0.28, ay: 0.30 },
-  { hue: "#493779", r: 0.34, speed: 65000, phase: 2.1, ax: 0.72, ay: 0.62 },
-  { hue: "#0f3d4d", r: 0.30, speed: 78000, phase: 4.2, ax: 0.55, ay: 0.85 },
+  { hue: "#14323c", r: 0.44, speed: 90000, phase: 0.0, ax: 0.28, ay: 0.30 },
+  { hue: "#16233c", r: 0.36, speed: 65000, phase: 2.1, ax: 0.72, ay: 0.62 },
+  { hue: "#3a3050", r: 0.26, speed: 78000, phase: 4.2, ax: 0.58, ay: 0.86 },
 ];
 
 export class Nebula {
@@ -95,9 +95,9 @@ export class Nebula {
     ctx.clearRect(0, 0, w, h);
     // 宇宙底
     const g = ctx.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, "#070c1a");
-    g.addColorStop(0.55, "#050914");
-    g.addColorStop(1, "#040711");
+    g.addColorStop(0, "#0a1119");
+    g.addColorStop(0.55, "#080e18");
+    g.addColorStop(1, "#060b12");
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, w, h);
     // 星云（径向渐变光斑，极慢漂移）

@@ -46,6 +46,8 @@ export class ConversationPane {
     const inst = convInfo?.instance;
     const binding = convInfo?.binding;
     const ss = convInfo?.session_state;
+    const active = convInfo?.active_input;
+    const busy = !!active && ["dispatched", "running", "cancelling"].includes(active.state);
     const head = el("div", { class: "conv-head" },
       el("span", { class: "conv-dot " + (inst ? "live" : "off") }),
       el("span", { class: "conv-head-name" }, this.agent.name),
@@ -58,8 +60,8 @@ export class ConversationPane {
         : convInfo?.bridge === "acp"
           ? el("span", { class: "tag green" }, "ACP")
           : null,
-      ss?.status ? el("span", { class: "tag " + (ss.status === "working" ? "cyan" : "") },
-        `会话 ${ss.status}`) : null,
+      ss?.status || active ? el("span", { class: "tag " + (busy ? "cyan" : "") },
+        busy ? "生成中" : `会话 ${ss?.status || "未知"}`) : null,
       ss?.model ? el("span", { class: "conv-sid", title: "确认模型" },
         `${ss.model.providerId}/${ss.model.modelId}`) : null,
       (binding?.session_id || inst?.handle || "").startsWith("sess")

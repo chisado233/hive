@@ -89,6 +89,26 @@ function enterApp() {
   $("#inbox-entry").onclick = () => openInbox();
   $("#eventband-toggle").onclick = () =>
     $("#eventband").classList.toggle("collapsed");
+  // 导航轨
+  $("#rail-map").onclick = () => { setRail("map"); closeDetail(); toggleDrawer(false); };
+  $("#rail-nodes").onclick = () => toggleDrawer();
+  $("#rail-assets").onclick = () => {
+    const proj = store.projects.find(p => p.key === store.currentProject)
+      || store.projects[0];
+    if (proj && proj.has_assets) { openPanel(); assets.open(proj.key); }
+    else toast("当前项目没有资产目录", "info");
+  };
+  $("#rail-events").onclick = () =>
+    $("#eventband").classList.toggle("collapsed");
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") toggleDrawer(false);
+  });
+  document.addEventListener("pointerdown", (e) => {
+    const d = $("#drawer");
+    if (d.classList.contains("open") && !d.contains(e.target) &&
+        e.target.id !== "rail-nodes" && !e.target.closest("#rail-nodes"))
+      toggleDrawer(false);
+  });
   for (const b of document.querySelectorAll("#edge-mode .seg-btn")) {
     b.classList.toggle("active", b.dataset.mode === store.edgeMode);
     b.onclick = () => {
@@ -104,6 +124,23 @@ function enterApp() {
   onChange(onStoreChange);
   startPolling();
   setTimeout(() => $("#graph-hint").style.opacity = 0, 9000);
+}
+
+function setRail(which) {
+  for (const b of document.querySelectorAll(".rail-btn"))
+    b.classList.remove("active");
+  const map = { map: "rail-map", nodes: "rail-nodes", assets: "rail-assets",
+    events: "rail-events" };
+  const el = document.getElementById(map[which]);
+  if (el) el.classList.add("active");
+}
+
+function toggleDrawer(force) {
+  const d = $("#drawer");
+  const open = force !== undefined ? force : !d.classList.contains("open");
+  d.classList.toggle("open", open);
+  d.setAttribute("aria-hidden", String(!open));
+  setRail(open ? "nodes" : "map");
 }
 
 // ---------------- 状态变化 ----------------
@@ -177,7 +214,8 @@ function renderNavNodes() {
     byLine.get(k).push(a);
   }
   const LINE_LABEL = { coordinator: "项目负责人", research: "研究",
-    "skill-test": "Skill 测试线", evolution: "反馈进化线", production: "正式生产线" };
+    "skill-test": "Skill 测试线", evolution: "反馈进化线", production: "正式生产线",
+    other: "其他节点" };
   for (const [line, group] of byLine) {
     host.append(el("div", { class: "nav-group-label" },
       `${LINE_LABEL[line] || line}（${group.length}）`));

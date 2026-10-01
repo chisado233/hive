@@ -124,6 +124,8 @@ class AcpBridge:
         self._loaded_sessions: set[str] = set()
         self._boot_ts = time.monotonic()
         self._turn_row: dict[str, dict] = {}
+        # 待决权限请求：conv request_id → {"rpc_id": 上游帧id, "session_id"}
+        self._pending_perms: dict[str, dict] = {}
 
     # ---------------- lifecycle ----------------
     def start(self):
@@ -270,33 +272,65 @@ class AcpBridge:
             self._reconcile_input(p)
 
     def _on_reverse_request(self, msg: dict):
-        # session/request_permission：登记待决权限卡，答复由 UI 显式给出
+        # session/request_permission：登记待决权限卡并保留 rpc id，
+        # 答复由 answer_permission 显式送达（DEF-11 真实答复链路）
         p = msg.get("params") or {}
         rid = msg.get("id")
-        meta = (p.get("_meta") or {}).get("zsession") or {}
-        agent_id = meta.get("agentId")
-        if msg.get("method") == "session/request_permission" and agent_id:
+        if msg.get("method") == "session/request_permission":
+            meta = (p.get("_meta") or {}).get("zsession") or {}
+            agent_id = meta.get("agentId")
+            sid = p.get("sessionId", "")
+            if not agent_id:
+                b = self.svc.store.conn.execute(
+                    "SELECT agent_id FROM conv_bindings WHERE session_id=?",
+                    (sid,)).fetchone()
+                agent_id = b["agent_id"] if b else None
+            key = f"perm-{rid}"
+            self._pending_perms[key] = {"rpc_id": rid, "session_id": sid}
             conv.add_conv_event(
-                self.svc, session_id=p.get("sessionId", ""),
+                self.svc, session_id=sid,
                 type="permission.request", source="acp", agent_id=agent_id,
-                payload={"request_id": rid, "tool": p.get("toolCall"),
+                payload={"request_id": key,
+                         "tool": ((p.get("toolCall") or {}).get("title")
+                                  or p.get("toolCall")),
                          "options": p.get("options"), "state": "pending"},
-                dedupe_key=f"perm-{rid}")
+                dedupe_key=key)
         else:
             # 未实现的反向请求：明确取消，不悬挂
             self._outbox.put(json.dumps({"jsonrpc": "2.0", "id": rid,
                 "error": {"code": -32601, "message": "method not implemented"}},
                 ensure_ascii=False))
 
+    def answer_permission(self, request_id: str, answer: dict):
+        """把 UI 选择送回原声待决请求（真实 JSON-RPC 响应帧）。"""
+        rec = self._pending_perms.pop(request_id, None)
+        if not rec:
+            raise HiveError("NOT_FOUND", "权限请求不存在或已答复/过期")
+        outcome = answer.get("optionId") or answer.get("option_id") \
+            or answer.get("outcome") or "reject"
+        self._outbox.put(json.dumps({
+            "jsonrpc": "2.0", "id": rec["rpc_id"],
+            "result": {"outcome": {"outcome": "selected",
+                                   "optionId": outcome}}},
+            ensure_ascii=False))
+        # 记录答复事实（权限卡状态更新）
+        b = self.svc.store.conn.execute(
+            "SELECT agent_id FROM conv_bindings WHERE session_id=?",
+            (rec["session_id"],)).fetchone()
+        conv.add_conv_event(
+            self.svc, session_id=rec["session_id"], type="permission.resolved",
+            source="acp", agent_id=b["agent_id"] if b else None,
+            payload={"request_id": request_id, "option": outcome})
+
     def _project_update(self, p: dict):
-        """上游 session/update 投影。上游帧（见 ACP_INTEGRATION.md §4）：
-        {sessionId, update:{sessionUpdate, content?|toolCallId?|title?|status?}}
-        chunk 无 rowId 且为字符级 append —— 按会话+序号聚合消息行，
-        payload.append 由投影层与前端累加。"""
+        """上游 session/update 投影。回放帧（_meta.zsession.replay=true）不入
+        conv_events——历史由 /sessions/:id/history 分页提供，避免双写重复。"""
+        meta = (p.get("_meta") or {}).get("zsession") or {}
+        if meta.get("replay"):
+            return
         sid = p.get("sessionId")
         upd = p.get("update") or {}
         kind = upd.get("sessionUpdate")
-        meta = (p.get("_meta") or {}).get("zsession") or {}
         agent_id = meta.get("agentId")
         if not agent_id:
             b = self.svc.store.conn.execute(
