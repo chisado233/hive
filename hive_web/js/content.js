@@ -229,9 +229,23 @@ export function renderField(f, value, onChange) {
     const selected = new Set(multi ? (Array.isArray(value) ? value : []) :
       (value != null ? [value] : []));
     const list = el("div");
+    // RDEF-11：≤4 个选项的单选呈现为分段按钮组（语义明确、未选空心）
+    const segmented = !multi && (f.options || []).length <= 4;
     const redraw = () => {
       list.textContent = "";
+      list.className = segmented ? "verdict-seg" : "";
       for (const o of f.options || []) {
+        if (segmented) {
+          const btn = el("button", {
+            type: "button",
+            class: "on-" + (o.id || "") + (selected.has(o.id) ? " picked" : ""),
+            title: o.desc || o.label || o.id,
+            onclick: () => { selected.clear(); selected.add(o.id);
+              touched = true; redraw(); onChange(); },
+          }, o.label || o.id);
+          list.append(btn);
+          continue;
+        }
         const input = el("input", { type: multi ? "checkbox" : "radio",
           name: "f_" + f.id });
         input.checked = selected.has(o.id);
@@ -275,6 +289,11 @@ export function renderField(f, value, onChange) {
     const num = el("input", { class: "score-num", type: "number",
       min: lo, max: hi, step });
     const val = el("span", { class: "score-val score-unset" }, "未评分");
+    // RDEF-11：刻度与范围提示（0/中值/100），当前值实时显示
+    const ticks = el("div", { class: "score-ticks" },
+      el("span", {}, String(lo)),
+      el("span", {}, String(Math.round((lo + hi) / 2))),
+      el("span", {}, String(hi)));
     const setVal = (v, from) => {
       if (v == null || v === "" || isNaN(+v)) {
         touched = false; slider.value = lo; num.value = "";
@@ -283,7 +302,7 @@ export function renderField(f, value, onChange) {
         let n = Math.round((+v) / step) * step;
         n = Math.min(hi, Math.max(lo, n));
         touched = true; slider.value = n; num.value = n;
-        val.textContent = n; val.classList.remove("score-unset");
+        val.textContent = `${n} / ${hi}`; val.classList.remove("score-unset");
       }
       if (from !== "init") onChange();
     };
@@ -291,8 +310,8 @@ export function renderField(f, value, onChange) {
     slider.addEventListener("input", () => setVal(slider.value));
     num.addEventListener("input", () => setVal(num.value));
     if (value != null) setVal(value, "init");
-    get = () => touched ? +slider.value : null;   // 未触碰 → null（不会变默认50）
-    box.append(el("div", { class: "score-row" }, slider, num, val));
+    get = () => touched ? +slider.value : null;   // 未触碰 → null（不会变默认50分）
+    box.append(el("div", { class: "score-row" }, slider, num, val), ticks);
   } else if (f.type === "long_text") {
     const ta = el("textarea", { class: "text-input", rows: 3,
       placeholder: f.placeholder || "" });
@@ -324,10 +343,17 @@ export function renderField(f, value, onChange) {
 }
 
 // ---------------- video-lab 双重评价 ----------------
-// 检测 TASK_CONTRACT §3 的评价模板键
+// 检测 TASK_CONTRACT §3 的评价模板键，或业务声明的双评价意图
+// （request_type=dual_evaluation / human_eval+intent=feedback 类）：
+// 任务未带结构化字段时也按契约渲染标准双评分表单
 export function isDualEvalData(data) {
   if (!data || typeof data !== "object") return false;
-  return "artifact_score" in data && "review_score" in data;
+  if ("artifact_score" in data && "review_score" in data) return true;
+  if (data.request_type === "dual_evaluation") return true;
+  if (data.human_eval === true &&
+      ["review_artifact", "feedback", "release"].includes(data.intent))
+    return true;
+  return false;
 }
 
 // 构建双重评价字段组（与 TASK_CONTRACT 字段名严格一致）

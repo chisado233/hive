@@ -126,6 +126,10 @@ class AcpBridge:
         self._turn_row: dict[str, dict] = {}
         # 待决权限请求：conv request_id → {"rpc_id": 上游帧id, "session_id"}
         self._pending_perms: dict[str, dict] = {}
+        # RDEF-03：load 回放窗口（此间的 chunk 视为历史，不入库）
+        self._replaying: set[str] = set()
+        # RDEF-14：已写过 turn.started 的 input_id（幂等）
+        self._started_inputs: set[str] = set()
 
     # ---------------- lifecycle ----------------
     def start(self):
@@ -323,13 +327,18 @@ class AcpBridge:
             payload={"request_id": request_id, "option": outcome})
 
     def _project_update(self, p: dict):
-        """上游 session/update 投影。回放帧（_meta.zsession.replay=true）不入
-        conv_events——历史由 /sessions/:id/history 分页提供，避免双写重复。"""
+        """上游 session/update 投影。回放帧（_meta.zsession.replay，兼容
+        params 级与 update 级两种位置）与 load 回放窗口内的帧均不入库——
+        历史统一走 /history 分页，避免双写。"""
         meta = (p.get("_meta") or {}).get("zsession") or {}
-        if meta.get("replay"):
+        upd0 = p.get("update") or {}
+        umeta = (upd0.get("_meta") or {}).get("zsession") or {}
+        if meta.get("replay") or umeta.get("replay"):
             return
         sid = p.get("sessionId")
-        upd = p.get("update") or {}
+        if sid in self._replaying:
+            return
+        upd = upd0
         kind = upd.get("sessionUpdate")
         agent_id = meta.get("agentId")
         if not agent_id:
@@ -451,7 +460,7 @@ class AcpBridge:
         if existing and existing["instance_id"] == inst["instance_id"] \
                 and existing["session_id"] in self._loaded_sessions:
             return existing
-        # 实例的 zsession 句柄即真实会话；session/load live-forward 接入
+        # 实例的 zsession 句柄即真实会话；session/load 接入
         # （不复制、不新建；adapter 重启后重新 load）
         handle = inst["handle"] or ""
         sid = handle.split(":", 1)[1] if handle.startswith("sess:") else None
@@ -460,14 +469,25 @@ class AcpBridge:
                             "该实例没有可接入的 ZSession 会话句柄",
                             {"handle": handle})
         if self.capabilities.get("loadSession"):
-            res = self.call("session/load", {
-                "sessionId": sid, "cwd": self._execution_root(agent_id)})
-            if not res.get("loaded", True):
-                reason = ((res.get("_meta") or {}).get("zsession") or {}).get(
-                    "reason") or "unknown"
-                raise HiveError("UPSTREAM_UNSUPPORTED",
-                                f"会话不可安全接入: {reason}",
-                                {"session_id": sid})
+            # RDEF-07：登记真实 owner 与代际（受管写入约束）
+            meta = {"zsession": {
+                "ownerId": f"hive/{agent_id}",
+                "instanceId": inst["instance_id"],
+                "generation": inst["generation"],
+                "agentId": agent_id}}
+            # RDEF-03 消费者防御：load 期间上游会先回放历史帧（可能缺
+            # replay 标记——上游 RDEF-03 未修）；历史统一走 /history 分页，
+            # 回放窗口内的 chunk 一律丢弃，不双写。
+            self._replaying.add(sid)
+            try:
+                self.call("session/load", {
+                    "sessionId": sid,
+                    "cwd": self._execution_root(agent_id),
+                    "_meta": meta})
+            except HiveError:
+                raise
+            finally:
+                self._replaying.discard(sid)
         else:
             raise HiveError("UPSTREAM_UNSUPPORTED",
                             "上游未声明 loadSession 能力")
@@ -477,16 +497,46 @@ class AcpBridge:
                                  project_root=self._execution_root(agent_id),
                                  connection_state="connected", source="acp")
 
+    def query_input_state(self, session_id: str, request_id: str) -> dict:
+        """上游持久输入对账（不触发模型调用）。"""
+        try:
+            return self.call("_zsession/get_input_state",
+                             {"sessionId": session_id,
+                              "requestId": request_id}, timeout=15) or {}
+        except HiveError:
+            return {}
+
     def send_prompt(self, binding: dict, inp) -> dict:
         meta = {"zsession": {
             "requestId": inp["request_id"], "inputId": inp["input_id"],
             "agentId": inp["agent_id"], "instanceId": inp["instance_id"],
-            "generation": inp["generation"], "source": "hive-console"}}
+            "generation": inp["generation"], "source": "hive-console",
+            "ownerId": f"hive/{inp['agent_id']}"}}
         blocks = [{"type": "text", "text": inp["text"]}]
         # 阻塞至真实轮次结束（上游以 stopReason 收口；忙时 -32011 冲突）
-        return self.call("session/prompt", {
+        receipt = self.call("session/prompt", {
             "sessionId": binding["session_id"], "prompt": blocks,
             "_meta": meta}, timeout=24 * 3600)
+        # RDEF-01 消费者防御：协议成功 ≠ 业务完成。用持久输入状态核实，
+        # 防"忙窗口把 requestId 登记成 rejected 后重试命中终态短路返回
+        # end_turn"的假成功路径。
+        st = self.query_input_state(binding["session_id"], inp["request_id"])
+        state = st.get("state")
+        if state == "rejected":
+            raise HiveError("UPSTREAM_ERROR",
+                            "上游将该输入登记为 rejected（忙窗口污染）——"
+                            "协议返回成功但无真实执行，按失败落账",
+                            {"upstream_state": state,
+                             "stopReason": (receipt or {}).get("stopReason"),
+                             "retryable": True})
+        if state and state not in ("done", "cancelled"):
+            # started/accepted 但 prompt 已返回：结果可疑，如实标注
+            self.svc.logger.warning("conv.suspicious_receipt",
+                                    state=state,
+                                    request=inp["request_id"])
+        receipt = dict(receipt or {})
+        receipt["_verified_state"] = state
+        return receipt
 
     def cancel_turn(self, binding: dict, turn_id: str | None = None):
         """DEF-08：session/cancel 按官方规范是无 id 通知，不等响应。
@@ -545,7 +595,7 @@ class ConversationService:
             self._threads.append(t)
 
     def _supervise_bridge(self):
-        """ACP 桥断线重启监督（15s 退避）。fixture 桥无进程，直接跳过。"""
+        """ACP 桥断线重启监督（15s 退避）+ 重连后持久对账（RDEF-04）。"""
         if not hasattr(self.bridge, "_alive"):
             return
         if self.bridge._alive.is_set():
@@ -557,8 +607,16 @@ class ConversationService:
         try:
             self.bridge.start()
             self.svc.logger.info("acp.reconnected")
+            threading.Thread(target=self._safe_reconcile, daemon=True,
+                             name="conv-reconcile").start()
         except Exception as e:  # noqa: BLE001
             self.svc.logger.error("acp.restart_failed", error=repr(e))
+
+    def _safe_reconcile(self):
+        try:
+            self.reconcile_once()
+        except Exception as e:  # noqa: BLE001
+            self.svc.logger.error("conv.reconcile_failed", error=repr(e))
 
     def _eager_attach(self):
         """把活跃 zsession 实例的会话接到桥上（只读 attach，不启动实例、
@@ -602,76 +660,98 @@ class ConversationService:
             self._working.discard(agent_id)
 
     def _dispatch_one(self, agent_id: str, inst: dict):
+        inp = None
         try:
             inp = conv.next_queued(self.svc, agent_id)
             if not inp:
                 return
-            conv.set_input_state(self.svc, inp["input_id"], "dispatched")
+            input_id = inp["input_id"]      # RDEF-01：本路径固定输入身份
+            conv.set_input_state(self.svc, input_id, "dispatched")
             binding = self.bridge.ensure(agent_id, inst)
             if not binding.get("session_id"):
                 raise HiveError("UPSTREAM_UNSUPPORTED", "会话绑定缺少 session_id")
-            conv.set_input_state(self.svc, inp["input_id"], "dispatched",
+            conv.set_input_state(self.svc, input_id, "dispatched",
                                  session_id=binding["session_id"])
             sid = binding["session_id"]
-            turn_id = f"turn-{inp['input_id']}"
-            has_turn_api = hasattr(self.bridge, "begin_turn")
-            if has_turn_api:
-                self.bridge.begin_turn(sid, inp["input_id"])
+            turn_id = f"turn-{input_id}"
+            if hasattr(self.bridge, "begin_turn"):
+                self.bridge.begin_turn(sid, input_id)
+            # RDEF-14：turn.started 只在首次真实派发尝试写入（busy 重试是
+            # attempt，不是第二次开始）
+            if input_id not in self._started_inputs:
+                self._started_inputs.add(input_id)
                 conv.add_conv_event(
                     self.svc, session_id=sid, type="turn.started",
                     source=self.bridge.name, agent_id=agent_id,
-                    turn_id=turn_id, payload={"input_id": inp["input_id"]})
+                    turn_id=turn_id, payload={"input_id": input_id})
             receipt = self.bridge.send_prompt(binding, inp)
             stop = (receipt or {}).get("stopReason") or "end_turn"
             fin = "cancelled" if stop == "cancelled" else "completed"
             if hasattr(self.bridge, "finalize_turn"):
                 self.bridge.finalize_turn(sid, fin)
-            if has_turn_api:
-                conv.add_conv_event(
-                    self.svc, session_id=sid,
-                    type="turn.cancelled" if stop == "cancelled"
-                    else "turn.completed",
-                    source=self.bridge.name, agent_id=agent_id, turn_id=turn_id,
-                    payload={"stop_reason": stop})
+            conv.add_conv_event(
+                self.svc, session_id=sid,
+                type="turn.cancelled" if stop == "cancelled"
+                else "turn.completed",
+                source=self.bridge.name, agent_id=agent_id, turn_id=turn_id,
+                payload={"stop_reason": stop,
+                         "verified_state": (receipt or {}).get("_verified_state")})
             if stop == "cancelled":
-                conv.set_input_state(self.svc, inp["input_id"], "cancelled",
+                conv.set_input_state(self.svc, input_id, "cancelled",
                                      upstream_input_id=(receipt or {}).get("inputId"),
                                      turn_id=turn_id)
             else:
-                conv.set_input_state(self.svc, inp["input_id"], "completed",
+                conv.set_input_state(self.svc, input_id, "completed",
                                      upstream_input_id=(receipt or {}).get("inputId"),
                                      turn_id=turn_id)
         except HiveError as e:
-            self._fail_input(agent_id, e)
+            self._fail_input(agent_id, inp, e)
             self.svc.logger.error("conv.dispatch_failed", agent=agent_id,
                                   error=repr(e))
         except Exception as e:  # noqa: BLE001 - 持久化失败原因，绝不静默
-            self._fail_input(agent_id, e)
+            wrapped = HiveError("INTERNAL_ERROR",
+                                f"{type(e).__name__}: {e}"[:400])
+            self._fail_input(agent_id, inp, wrapped)
             self.svc.logger.error("conv.dispatch_failed", agent=agent_id,
                                   error=repr(e))
         finally:
             self._working.discard(agent_id)
 
-    def _fail_input(self, agent_id: str, e):
-        """失败落账：忙冲突=回队重试（排队由 Hive 决策）；超时/断线=结果未知
-        （不盲目重放）；其余=failed。"""
+    def _fail_input(self, agent_id: str, inp, e: HiveError):
+        """失败落账（RDEF-01：输入身份由调用方传入，绝不重新猜测）。
+        忙冲突=回队重试；已登记 rejected=派生新 requestId 重置被污染的预约；
+        超时/断线=结果未知（不盲目重放）；其余=failed。"""
         upstream_code = ((getattr(e, "details", {}) or {}).get("upstream") or {}) \
             .get("code")
         if upstream_code == -32011:
-            # managed-write conflict：会话忙。输入回 queued 稍后重发
-            # （上游尚未登记该 requestId，重发安全）；10s 冷却防热循环。
-            inp = conv.next_queued(self.svc, agent_id)
-            if inp is None:
-                inp = conv.active_input(self.svc, agent_id)
-            if inp is not None and inp["state"] in ("queued", "dispatched"):
-                conv.set_input_state(self.svc, inp["input_id"], "queued")
             import time as _t
+            if inp is not None and inp["state"] in ("queued", "dispatched"):
+                # 上游忙窗口可能已把该 requestId 登记为终态 rejected（上游
+                # RDEF-01 未修）——重试会命中终态短路假成功。先查持久状态；
+                # 被污染则派生新 requestId（保留血缘），否则原 id 回队。
+                poisoned = False
+                if hasattr(self.bridge, "query_input_state") and inp.get("session_id"):
+                    st = self.bridge.query_input_state(
+                        inp["session_id"], inp["request_id"])
+                    if st.get("state") == "rejected":
+                        poisoned = True
+                if poisoned:
+                    new_rid = f"{inp['request_id']}#r{int(_t.time())}"
+                    with self.svc.store.write() as cur:
+                        cur.execute(
+                            "UPDATE conv_inputs SET request_id=?, state='queued',"
+                            " error=? WHERE input_id=?",
+                            (new_rid,
+                             f"busy窗口预约被上游登记rejected，派生新id重试"
+                             f"（原 {inp['request_id']}）", inp["input_id"]))
+                    self.svc.logger.warning(
+                        "conv.busy_poisoned_derived", agent=agent_id,
+                        old=inp["request_id"], new=new_rid)
+                else:
+                    conv.set_input_state(self.svc, inp["input_id"], "queued")
             self._cooldown[agent_id] = _t.monotonic() + 10
             self.svc.logger.warning("conv.busy_requeued", agent=agent_id)
             return
-        inp = conv.next_queued(self.svc, agent_id)
-        if inp is None:
-            inp = conv.active_input(self.svc, agent_id)
         if inp is None or inp["state"] not in ("queued", "dispatched"):
             return
         state = "outcome_unknown" if e.code in ("UPSTREAM_TIMEOUT",
@@ -681,6 +761,46 @@ class ConversationService:
                                  error=f"{e.code}: {e.message}"[:500])
         except Exception:  # noqa: BLE001
             pass
+
+    def reconcile_once(self):
+        """RDEF-04：桥（重）连后对 outcome_unknown 输入做持久对账——按上游
+        事实补账；无凭据/未落账保持 unknown，禁止把未知写成完成。"""
+        if not hasattr(self.bridge, "query_input_state"):
+            return
+        rows = self.svc.store.conn.execute(
+            "SELECT * FROM conv_inputs WHERE state='outcome_unknown'").fetchall()
+        for inp in rows:
+            sid = inp["session_id"] or (conv.get_binding(
+                self.svc, inp["agent_id"]) or {}).get("session_id")
+            if not sid:
+                continue
+            st = self.bridge.query_input_state(sid, inp["request_id"])
+            state = st.get("state")
+            if state == "done":
+                conv.set_input_state(self.svc, inp["input_id"], "completed",
+                                     error=None,
+                                     upstream_input_id=st.get("inputId"),
+                                     turn_id=f"turn-{inp['input_id']}")
+                conv.add_conv_event(
+                    self.svc, session_id=sid, type="turn.completed",
+                    source="reconcile", agent_id=inp["agent_id"],
+                    turn_id=f"turn-{inp['input_id']}",
+                    payload={"stop_reason": st.get("stopReason"),
+                             "reconciled": True})
+            elif state == "cancelled":
+                conv.set_input_state(self.svc, inp["input_id"], "cancelled",
+                                     error=None)
+            elif state == "rejected":
+                conv.set_input_state(
+                    self.svc, inp["input_id"], "failed",
+                    error="对账：上游登记 rejected（未真实执行）")
+            elif state == "failed":
+                conv.set_input_state(self.svc, inp["input_id"], "failed",
+                                     error="对账：上游登记 failed")
+            # accepted/started/reserved/unknown：保留 outcome_unknown
+            # （上游 idle 不代表旧输入成功——不猜）
+        if rows:
+            self.svc.logger.info("conv.reconciled", count=len(rows))
 
     def stop(self):
         self.bridge.close()

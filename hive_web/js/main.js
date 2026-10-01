@@ -225,6 +225,7 @@ function renderNavNodes() {
         ? (a.observation === "busy" ? "#43c6d8" : a.observation === "idle" ? "#57b389" : "#e5a33c")
         : "#4d5663";
       const row = el("div", { class: "nav-node", onclick: () => {
+          toggleDrawer(false);   // RDEF-11：选择节点后自动收起导航
           onSelect({ kind: "agent", id: "agent:" + a.agent_id });
           graph.centerOn("agent:" + a.agent_id);
         } },
@@ -241,7 +242,7 @@ function renderNavNodes() {
   if (proj && proj.has_assets) {
     host.append(el("div", { class: "nav-group-label" }, "资产"));
     host.append(el("div", { class: "nav-node",
-      onclick: () => assets.open(proj.key) },
+      onclick: () => { toggleDrawer(false); assets.open(proj.key); } },
       el("span", {}, "▣"),
       el("span", {}, "共享资产库")));
   }

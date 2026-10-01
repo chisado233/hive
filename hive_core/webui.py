@@ -1137,7 +1137,15 @@ class WebUI:
                                     "data": {"cancelled": False,
                                              "note": "当前没有活动轮次"}})
                 return True
-            # DEF-18：先标 cancelling（不直接 cancelled）；桥失败回滚 running
+            # RDEF-10：turn 守卫——预期轮不匹配则拒绝（防竞态误杀下一轮）
+            expected_turn = data.get("expected_turn_id")
+            if expected_turn and active["turn_id"] and \
+                    expected_turn != active["turn_id"]:
+                raise HiveError("STALE_INSTANCE",
+                                f"预期轮次 {expected_turn} 与当前活动轮 "
+                                f"{active['turn_id']} 不符，未取消",
+                                {"active_turn": active["turn_id"]})
+            # DEF-18/RDEF-10：先标 cancelling（不直接 cancelled）；桥失败回滚
             conv.set_input_state(self.svc, active["input_id"], "cancelling")
             bridge = getattr(self.svc, "conversation", None)
             if bridge:

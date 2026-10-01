@@ -22,6 +22,9 @@ export class ConversationPane {
     this.es = null;
     this.rowsById = new Map();   // row_id → DOM 引用（就地更新，不整树重建）
     this.destroyed = false;
+    this._lastEventAt = Date.now();
+    this._lastKnownActive = null;   // 上次权威校对的活动输入状态
+    this._watchdog = null;
   }
 
   async mount() {
@@ -91,6 +94,7 @@ export class ConversationPane {
     this.destroyed = true;
     this.cache.scrollTop = this.flow ? this.flow.scrollTop : null;
     this._closeStream();
+    if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
   }
 
   // ---------------- 历史投影 ----------------
@@ -328,13 +332,25 @@ export class ConversationPane {
   async _cancel(btn) {
     btn.disabled = true;
     try {
+      // RDEF-10：携带实例/代际/预期轮守卫，防竞态误杀下一轮
+      let guard = {};
+      try {
+        const d = await fetch(`/ui/api/agent/${this.agentId}/conversation`,
+          { headers: { "X-Requested-With": "hive-ui" } }).then(r => r.json());
+        const inst = d.data?.instance, act = d.data?.active_input;
+        if (inst) guard = { instance_id: inst.instance_id,
+                            generation: inst.generation };
+        if (act?.turn_id) guard.expected_turn_id = act.turn_id;
+      } catch { /* 守卫尽力携带 */ }
       const r = await fetch(`/ui/api/agent/${this.agentId}/conversation/cancel`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Requested-With": "hive-ui" },
-        body: JSON.stringify({ request_id: uuid() }),
+        body: JSON.stringify({ request_id: uuid(), ...guard }),
       }).then(r => r.json());
-      if (r.ok && r.data?.cancelled) toast("已请求取消本轮", "ok");
-      else toast(r.data?.note || r.data?.upstream_error || "当前没有活动轮次", "info");
+      if (r.ok && (r.data?.cancelling || r.data?.cancelled))
+        toast("已请求取消本轮，等待原生确认…", "ok");
+      else toast(r.data?.note || r.data?.upstream_error ||
+                 r.error?.message || "当前没有活动轮次", "info", 4500);
     } catch (e) { toast("取消失败", "err"); }
     finally { btn.disabled = false; this._refreshQueue(); }
   }
@@ -363,6 +379,7 @@ export class ConversationPane {
     this.es = new EventSource(url);
     this._streamState("connecting");
     this._lastBeat = Date.now();
+    this._startWatchdog();
     this._beatTimer = setInterval(() => {
       // 25s 无心跳即视为断开（服务端 15s 心跳）
       if (Date.now() - this._lastBeat > 25000) this._streamState("stalled");
@@ -375,6 +392,7 @@ export class ConversationPane {
       this.es.addEventListener(k, (e) => {
         if (this.destroyed) return;
         this._lastBeat = Date.now();
+        this._lastEventAt = Date.now();
         this._streamState("live");
         const ev = JSON.parse(e.data);
         if (ev.cursor) this.cache.cursor = ev.cursor;
@@ -398,6 +416,45 @@ export class ConversationPane {
     if (this._beatTimer) { clearInterval(this._beatTimer); this._beatTimer = null; }
   }
 
+  // RDEF-08：停流看门狗——连接未断但业务事件停流时（合法长工具也可能
+  // 安静，故仅在有活动输入且长时间无事件时）低频校对权威状态；不一致
+  // 即从游标重建订阅并补齐，不双写、不重发输入。
+  _startWatchdog() {
+    if (this._watchdog) clearInterval(this._watchdog);
+    this._watchdog = setInterval(async () => {
+      if (this.destroyed || !this.es) return;
+      const silentMs = Date.now() - this._lastEventAt;
+      if (silentMs < 18000) return;
+      try {
+        const d = await fetch(
+          `/ui/api/agent/${this.agentId}/conversation`,
+          { headers: { "X-Requested-With": "hive-ui" } }).then(r => r.json());
+        if (!d.ok) return;
+        const act = d.data?.active_input || null;
+        const actKey = act ? `${act.input_id}:${act.state}` : "none";
+        if (actKey !== this._lastKnownActive || silentMs > 60000) {
+          this._lastKnownActive = actKey;
+          // 权威状态与本地不一致（或长时间静默后强制校对）：重建订阅+补尾
+          this._streamState("resync");
+          this._connectStream();
+          await this._refreshTail();
+          toast("实时通道已自动校对恢复", "info", 2500);
+        }
+        this._lastEventAt = Date.now();
+      } catch { /* 网络层失败由 onerror 分支处理 */ }
+    }, 8000);
+  }
+
+  async _refreshTail() {
+    try {
+      const d = await fetch(`/ui/api/agent/${this.agentId}/conversation`,
+        { headers: { "X-Requested-With": "hive-ui" } }).then(r => r.json());
+      if (!d.ok) return;
+      this._renderHistory(d.data?.tail, d.data);
+      this._refreshQueue();
+    } catch { /* 忽略 */ }
+  }
+
   _streamState(state) {
     let bar = this.host.querySelector(".conv-stream-state");
     if (!bar) {
@@ -409,6 +466,7 @@ export class ConversationPane {
       reconnecting: "⟳ 实时连接中断，正在重连…",
       stalled: "⟳ 实时通道无心跳（>25s），正在重连…",
       closed: "✕ 实时通道已关闭——刷新面板恢复",
+      resync: "⟳ 检测到数据停流，正在校对补齐…",
     };
     const text = map[state];
     bar.classList.toggle("hidden", !text);

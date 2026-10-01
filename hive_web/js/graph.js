@@ -105,7 +105,7 @@ export class Graph {
       group.forEach((a, i) => {
         pos["agent:" + a.agent_id] = { x: CX - w / 2 + i * X_GAP, y };
       });
-      this.regionLabels.push({ text: LINE_LABEL[line] || line, x: CX, y: y - 74 });
+      this.regionLabels.push({ text: LINE_LABEL[line] || line, x: CX - 560, y: y - 74, anchor: "start" });
       y += Y_GAP;
     }
     // 资产库：右侧；人类：底部中央
@@ -253,7 +253,8 @@ export class Graph {
   _renderRegions() {
     this.gRegions.textContent = "";
     for (const r of this.regionLabels) {
-      const t = s("text", { class: "region-label", x: r.x, y: r.y, "text-anchor": "middle" });
+      const t = s("text", { class: "region-label", x: r.x, y: r.y,
+        "text-anchor": r.anchor || "middle" });
       t.textContent = r.text;
       this.gRegions.append(t);
     }
@@ -406,6 +407,9 @@ export class Graph {
     this.edges = edges;
     this.gEdges.textContent = "";
     const pairCount = new Map();
+    const selected = store.selection &&
+      (store.selection.kind === "agent" || store.selection.kind === "human" ||
+       store.selection.kind === "asset");
     for (const e of edges) {
       const from = this.nodes.get(e.from), to = this.nodes.get(e.to);
       if (!from || !to) continue;
@@ -421,25 +425,52 @@ export class Graph {
         "stroke-dasharray": st.dash, "marker-end": `url(#${st.marker})`,
       });
       g.append(vis);
-      if (e.tasks.length) {
+      // RDEF-12：边标签默认稀疏——仅在 hover 或选中相关子图时显示计数，
+      // 信息由点击边/任务列表承载，不在满图铺文字
+      const related = !selected || this._relatedToSelection(e);
+      const showLabel = related && (e.cls !== "flow" || this._hoverEdge === g);
+      if (e.tasks.length && showLabel) {
         const label = s("text", { class: "edge-label edge-count", x: lx, y: ly });
         label.textContent = e.cls === "callback"
-          ? `回执 ×${e.tasks.length}` : `${e.tasks.length} 件任务`;
+          ? `回执 ×${e.tasks.length}` : `${e.tasks.length} 件`;
         g.append(label);
-        g.addEventListener("click", (ev) => {
-          ev.stopPropagation();
+      }
+      g.addEventListener("mouseenter", () => {
+        this._hoverEdge = g;
+        const l = g.querySelector(".edge-count");
+        if (l) l.style.display = "";
+        if (e.tasks.length && !g.querySelector(".edge-count")) {
+          const label = s("text", { class: "edge-label edge-count",
+            x: lx, y: ly });
+          label.textContent = e.cls === "callback"
+            ? `回执 ×${e.tasks.length}` : `${e.tasks.length} 件任务`;
+          g.append(label);
+        }
+      });
+      g.addEventListener("mouseleave", () => {
+        this._hoverEdge = null;
+        if (e.cls === "flow" && !related)
+          g.querySelector(".edge-count")?.remove();
+        else if (e.cls === "flow") {
+          // 恢复稀疏态：hover 生成的详细标签退回隐藏
+          const l = g.querySelector(".edge-count");
+          if (l) l.style.display = "none";
+        }
+      });
+      g.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (e.tasks.length) {
           this.onSelect({ kind: "edge", tasks: e.tasks.map(t => t.task_id),
                           cls: e.cls, from: e.from, to: e.to });
-        });
-      } else {
-        const label = s("text", { class: "edge-label", x: lx, y: ly });
-        label.textContent = e.cls === "sub" ? "订阅" :
-          e.cls === "asset-read" ? "声明读取" : "";
-        g.append(label);
-        g.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          this.onSelect({ kind: "port", id: e.to.startsWith("port:") ? e.to : e.from });
-        });
+        } else {
+          this.onSelect({ kind: "port",
+            id: e.to.startsWith("port:") ? e.to : e.from });
+        }
+      });
+      // 初始稀疏：flow 边的计数标签隐藏
+      if (e.cls === "flow" && e.tasks.length) {
+        const l = g.querySelector(".edge-count");
+        if (l) l.style.display = "none";
       }
       this.gEdges.append(g);
       e.el = g;
@@ -447,6 +478,12 @@ export class Graph {
   }
 
   // ---------------- 选中高亮 ----------------
+  _relatedToSelection(e) {
+    const sel = store.selection;
+    if (!sel) return true;
+    return e.from === sel.id || e.to === sel.id;
+  }
+
   applySelectionDim() {
     const sel = store.selection;
     const connected = new Set();
