@@ -79,3 +79,21 @@ delta 按 `row_id` 就地合并；`replay=true` 标记重放。
 `/ui/api/command` 白名单转发 41 条只读/受控命令（见 webui.py UI_COMMAND_WHITELIST）。
 control test *、system 管理类、permission grant/revoke 等不在白名单。
 聊天不生成 work：发正式任务走 emit.new（「发任务」按钮打开既有表单）。
+
+## 6. 第三轮修订（SDEF 修复后）
+
+- **有效表单 schema 单一真源**：`GET /ui/api/task/:id` 返回 `eval_fields`
+  （显式 ui.fields 或双评价兜底 schema，服务端权威）+ `eval_schema_version`；
+  前端渲染消费同一份。POST /ui/api/human/answer 对两种答复表示
+  （data.answers.X / 顶层 X）归一为唯一规范值后按同一 schema 服务端复验：
+  冲突/越界/类型/步长/选项/必填违规 → 400 field_errors，不改任务终态；
+  合法结果经 normalize 后入账（未评分=null 语义保持）。
+- **turn.started 事实驱动**：由上游 input_state=started 通知产生，DB 级
+  幂等（event_id=turn-started-{input_id}）；busy 重试不产生重复 started。
+- **writerToken**：每 agent+generation 高熵凭据（服务端文件保存，不下发），
+  ensure/load 与 prompt 按合同携带；运行时启用 HIVE_ACP_WRITER_KEY=1
+  （当前默认关：上游 adapter 丢弃写凭据头 acp.mjs:50，绑定 key 会阻断
+  adapter 自身写入——上游修复后开启）。弱模式 ensure 前自动释放本方
+  残留 claim，防旧凭据锁死。
+- **登录竞态**：认证请求代次守卫 + enterApp 幂等 + auth-lost 双确认；
+  HttpOnly cookie 语义不变。

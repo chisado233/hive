@@ -94,7 +94,11 @@ export class Composer {
     if (isDualEvalData(data)) {
       fieldsHost.append(el("div", { class: "dual-col-title" }, "双重评价——产物与审核分别评分"));
       const grid = el("div", { class: "dual" });
-      for (const f of dualEvalFields(data)) {
+      // SDEF-02：优先服务端 schema（与后端校验同源），本地副本仅离线兜底
+      const schema = Array.isArray(this.task.eval_fields) &&
+        this.task.eval_fields.length ? this.task.eval_fields
+        : dualEvalFields(data);
+      for (const f of schema) {
         const w = renderField(f, this.draft.answers[f.id], () => this.saveDraft());
         this.fields.push(w);
         (["artifact_decision", "artifact_score", "review_decision", "review_score"]

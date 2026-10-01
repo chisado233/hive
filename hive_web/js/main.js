@@ -14,9 +14,14 @@ const $ = (s) => document.querySelector(s);
 let graph, detail, inbox, assets, firstLayout = true;
 
 // ---------------- 启动 ----------------
+let _authGen = 0;        // SDEF-04：认证请求代次（迟到的旧判定不覆盖新状态）
+let _entered = false;    // enterApp 幂等
+
 boot();
 async function boot() {
+  const gen = ++_authGen;
   const s = await api.session().catch(() => null);
+  if (gen !== _authGen) return;          // 已被更新的登录/登出超越
   if (s && s.authenticated) {
     store.me = s.subject;
     enterApp();
@@ -26,6 +31,7 @@ async function boot() {
 }
 
 function showLogin(msg = "") {
+  ++_authGen;                            // 任何进入登录屏的动作使旧判定失效
   $("#login").classList.remove("hidden");
   $("#app").classList.add("hidden");
   $("#login-note").textContent = "";
@@ -41,14 +47,21 @@ function showLogin(msg = "") {
     const token = input.value.trim();
     if (!token) return;
     btn.disabled = true;
+    const gen = ++_authGen;
     try {
       const r = await api.login(token);
-      input.value = "";                    // 提交后立即清空 secret
+      if (gen !== _authGen) return;      // 退出后的迟到登录响应：丢弃
+      input.value = "";                  // 提交后立即清空 secret
       store.me = r.subject;
       $("#login").classList.add("hidden");
       enterApp();
+      // 登录后主动重验会话，驱动视图一致（不依赖下一次轮询）
+      api.session().then((s2) => {
+        if (gen !== _authGen) return;
+        if (!(s2 && s2.authenticated)) showLogin("会话未生效，请重试");
+      }).catch(() => {});
     } catch (e) {
-      showLogin(errText(e));
+      if (gen === _authGen) showLogin(errText(e));
     } finally {
       btn.disabled = false;
     }
@@ -59,11 +72,18 @@ function showLogin(msg = "") {
 }
 
 function enterApp() {
+  if (_entered) {                         // 幂等：不重复注册监听/轮询
+    $("#app").classList.remove("hidden");
+    return;
+  }
+  _entered = true;
   $("#app").classList.remove("hidden");
   if (!window.__nebula)
     window.__nebula = new Nebula(document.getElementById("nebula"));
   $("#user-chip").textContent = store.me.name + " · " + store.me.type;
   $("#logout-btn").onclick = async () => {
+    _authGen++;                       // SDEF-04：作废在途认证响应
+    stopPolling();
     await api.logout().catch(() => {});
     location.reload();
   };
@@ -146,7 +166,12 @@ function toggleDrawer(force) {
 // ---------------- 状态变化 ----------------
 function onStoreChange(what) {
   if (what === "auth-lost") {
-    showLogin("会话已过期，请重新登录");
+    // SDEF-04：双确认——一次 401 可能是瞬时竞态，先重验再踢登录，
+    // 避免登录成功后的迟到未认证响应把已进入的应用打回登录屏
+    api.session().then((s) => {
+      if (!(s && s.authenticated)) showLogin("会话已过期，请重新登录");
+      else store.online = true;
+    }).catch(() => showLogin("会话已过期，请重新登录"));
     return;
   }
   renderConn();

@@ -771,3 +771,20 @@ code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
   .drawer .drawer-title::after { content: "（点击外部或 Esc 关闭）";
     color: var(--text-3); font-size: 10.5px; letter-spacing: 0; margin-left: 8px; }
 }
+
+/* SDEF-07：极窄退出图标化 + 吸顶让位 + 刻度对比度 */
+.logout-icon { display: none; }
+.logout-icon svg { display: block; }
+.dt-content .card, .dt-content .field { scroll-margin-top: 118px; }
+.score-ticks { color: var(--text-2); font-size: 11px; }
+@media (max-width: 400px) {
+  .logout-text { display: none; }
+  .logout-icon { display: inline-flex; }
+  #logout-btn { padding: 6px 9px; }
+  .topbar { gap: 6px; padding: 0 6px; }
+  .conn { display: none; }          /* 极窄：连接点让位给退出入口 */
+  .brand-name { font-size: 14px; letter-spacing: .1em; }
+  .brand-mark { font-size: 15px; }
+  .project-picker select { max-width: 92px; padding: 6px 4px; font-size: 12.5px; }
+  .decide-entry { padding: 7px 9px; gap: 5px; }
+}

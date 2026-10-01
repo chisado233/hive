@@ -128,8 +128,6 @@ class AcpBridge:
         self._pending_perms: dict[str, dict] = {}
         # RDEF-03：load 回放窗口（此间的 chunk 视为历史，不入库）
         self._replaying: set[str] = set()
-        # RDEF-14：已写过 turn.started 的 input_id（幂等）
-        self._started_inputs: set[str] = set()
 
     # ---------------- lifecycle ----------------
     def start(self):
@@ -444,6 +442,12 @@ class AcpBridge:
             conv.set_input_state(self.svc, row["input_id"], mapping[state],
                                  upstream_input_id=p.get("inputId"),
                                  turn_id=p.get("turnId"))
+        # SDEF-01/RDEF-14：原生 started 事实 → turn.started（DB 幂等）；
+        # busy 重试的派发 attempt 不会到达这里
+        if state == "started":
+            conv.ensure_turn_started(
+                self.svc, row["session_id"] or p.get("sessionId", ""),
+                row["agent_id"], row["input_id"], "acp")
 
     # ---------------- bridge contract ----------------
     def _execution_root(self, agent_id: str) -> str:
@@ -454,6 +458,68 @@ class AcpBridge:
                 "execution_root") or self.svc.home
         except HiveError:
             return self.svc.home
+
+    def _writer_token(self, agent_id: str, generation: int) -> str | None:
+        """SDEF-03：受管写入凭据——每 agent+generation 一个高熵 token，
+        存 <home>/runtime/conv-writer-keys/（0600，不进 conv_bindings/
+        日志/协议帧回显）。实例换代自然换 key（旧代际被上游拒绝）。
+
+        运行时启用由 HIVE_ACP_WRITER_KEY=1 控制：上游 adapter 的
+        DaemonClient.post 丢弃 writeHeaders 第三参（acp.mjs:50，SDEF-05
+        范围），key 绑定后 adapter 自身写请求不带头会被 409 拒绝。
+        机制已实现并核实 writerKeyBound；上游修复头转发后置环境变量启用。"""
+        import os as _os
+        if _os.environ.get("HIVE_ACP_WRITER_KEY") != "1":
+            return None
+        import secrets as _secrets
+        d = _os.path.join(self.svc.home, "runtime", "conv-writer-keys")
+        _os.makedirs(d, exist_ok=True)
+        path = _os.path.join(d, f"{agent_id}.g{generation}.key")
+        if _os.path.exists(path):
+            return open(path, "r", encoding="utf-8").read().strip()
+        tok = "hvwt_" + _secrets.token_urlsafe(32)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(tok)
+        try:
+            _os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return tok
+
+    def _release_claim(self, session_id: str, owner: str):
+        """释放本方受管登记（owner 直通；失败仅记录，不阻断）。"""
+        try:
+            import json as _json
+            import urllib.request as _ur
+            from .zsession_read import _daemon_cfg
+            base, token = _daemon_cfg(self.svc)
+            req = _ur.Request(
+                base + "/acp/release",
+                data=_json.dumps({"sessionId": session_id,
+                                  "owner": owner}).encode(),
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"}, method="POST")
+            with _ur.urlopen(req, timeout=10) as r:
+                body = _json.load(r)
+            self.svc.logger.info("conv.claim_released",
+                                 session=session_id[-8:],
+                                 released=bool(body.get("released", True)))
+        except Exception as e:  # noqa: BLE001
+            self.svc.logger.warning("conv.claim_release_failed",
+                                    session=session_id[-8:],
+                                    error=repr(e)[:120])
+
+    def _writer_bound(self, session_id: str) -> bool | None:
+        """核实 claim 的 writerKeyHash 已绑定（不把 claim 存在当凭据启用）。"""
+        try:
+            from .zsession_read import _get
+            claims = _get(self.svc, "/acp/claims") or {}
+            for c in (claims.get("claims") or []):
+                if c.get("sessionId") == session_id:
+                    return bool(c.get("writerKeyHash"))
+        except Exception:  # noqa: BLE001
+            return None
+        return None
 
     def ensure(self, agent_id: str, inst) -> dict:
         existing = conv.get_binding(self.svc, agent_id)
@@ -469,12 +535,19 @@ class AcpBridge:
                             "该实例没有可接入的 ZSession 会话句柄",
                             {"handle": handle})
         if self.capabilities.get("loadSession"):
-            # RDEF-07：登记真实 owner 与代际（受管写入约束）
+            # RDEF-07/SDEF-03：登记真实 owner、代际与受管写入凭据
             meta = {"zsession": {
                 "ownerId": f"hive/{agent_id}",
                 "instanceId": inst["instance_id"],
                 "generation": inst["generation"],
                 "agentId": agent_id}}
+            wt = self._writer_token(agent_id, inst["generation"])
+            if wt:
+                meta["zsession"]["writerToken"] = wt
+            else:
+                # 弱声明模式：先释放本 agent 名下可能残留的带 key claim
+                # （否则旧凭据持续拒绝写，且 adapter claim 冲突被静默吞掉）
+                self._release_claim(sid, f"hive/{agent_id}")
             # RDEF-03 消费者防御：load 期间上游会先回放历史帧（可能缺
             # replay 标记——上游 RDEF-03 未修）；历史统一走 /history 分页，
             # 回放窗口内的 chunk 一律丢弃，不双写。
@@ -491,6 +564,9 @@ class AcpBridge:
         else:
             raise HiveError("UPSTREAM_UNSUPPORTED",
                             "上游未声明 loadSession 能力")
+        bound = self._writer_bound(sid)
+        self.svc.logger.info("conv.claim", session=sid[-8:],
+                             writer_key_bound=bound)
         self._loaded_sessions.add(sid)
         return conv.bind_session(self.svc, agent_id, inst["instance_id"],
                                  inst["generation"], sid,
@@ -512,6 +588,9 @@ class AcpBridge:
             "agentId": inp["agent_id"], "instanceId": inp["instance_id"],
             "generation": inp["generation"], "source": "hive-console",
             "ownerId": f"hive/{inp['agent_id']}"}}
+        wt = self._writer_token(inp["agent_id"], inp["generation"])
+        if wt:
+            meta["zsession"]["writerToken"] = wt
         blocks = [{"type": "text", "text": inp["text"]}]
         # 阻塞至真实轮次结束（上游以 stopReason 收口；忙时 -32011 冲突）
         receipt = self.call("session/prompt", {
@@ -659,8 +738,19 @@ class ConversationService:
         finally:
             self._working.discard(agent_id)
 
+    def _bridge_ready(self) -> bool:
+        b = self.bridge
+        if not hasattr(b, "_alive"):
+            return True                      # fixture 桥无进程
+        return b._alive.is_set() and bool(b.capabilities)
+
     def _dispatch_one(self, agent_id: str, inst: dict):
         inp = None
+        # 桥未就绪（bootstrap/重连中）：回队短冷却，不把输入打成 failed
+        if not self._bridge_ready():
+            import time as _t
+            self._cooldown[agent_id] = _t.monotonic() + 2
+            return
         try:
             inp = conv.next_queued(self.svc, agent_id)
             if not inp:
@@ -676,15 +766,13 @@ class ConversationService:
             turn_id = f"turn-{input_id}"
             if hasattr(self.bridge, "begin_turn"):
                 self.bridge.begin_turn(sid, input_id)
-            # RDEF-14：turn.started 只在首次真实派发尝试写入（busy 重试是
-            # attempt，不是第二次开始）
-            if input_id not in self._started_inputs:
-                self._started_inputs.add(input_id)
-                conv.add_conv_event(
-                    self.svc, session_id=sid, type="turn.started",
-                    source=self.bridge.name, agent_id=agent_id,
-                    turn_id=turn_id, payload={"input_id": input_id})
+            # SDEF-01/RDEF-14：turn.started 由上游 input_state=started 事实
+            # 驱动（见 _reconcile_input，DB 级幂等）；busy 重试是派发 attempt，
+            # 不预写 started
             receipt = self.bridge.send_prompt(binding, inp)
+            # 收口兜底：轮次真实结束但 started 通知缺失时补一次（幂等）
+            conv.ensure_turn_started(self.svc, sid, agent_id, input_id,
+                                     self.bridge.name)
             stop = (receipt or {}).get("stopReason") or "end_turn"
             fin = "cancelled" if stop == "cancelled" else "completed"
             if hasattr(self.bridge, "finalize_turn"):

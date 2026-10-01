@@ -711,6 +711,11 @@ class WebUI:
                                "mark_seen": bool(qs.get("mark_seen"))})
         data["comments"] = peek.get("comments") or []
         data["wait_summary"] = peek.get("wait_summary")
+        # SDEF-02：服务端下发有效表单 schema（显式 fields 或双评价兜底），
+        # 前端消费同一版本；普通任务为 null（自由作答）
+        from .evalschema import effective_fields, DUAL_EVAL_SCHEMA_VERSION
+        data["eval_fields"] = effective_fields(data["task"].get("data") or {})
+        data["eval_schema_version"] = DUAL_EVAL_SCHEMA_VERSION
         # hydration for rendering related nodes
         for rel_key in ("parent_id", "reply_to"):
             rid = (data["task"].get(rel_key))
@@ -993,18 +998,32 @@ class WebUI:
             return True
 
     def _human_answer(self, h, subject, data, rid):
+        """SDEF-02：所有有效表单（显式 ui.fields 或双评价兜底 schema）都在
+        服务端复验；两种答复表示归一为唯一规范值；冲突/越界 → 400，不改
+        任务终态、不产生回执。"""
         from .tasks import get_task
+        from . import evalschema
         task_id = data.get("task") or ""
         row = get_task(self.svc, task_id)
         tdata = json.loads(row["data"] or "{}")
-        ui = tdata.get("ui") or {}
-        answers = (data.get("data") or {}).get("answers")
-        if ui.get("fields") and answers is not None:
-            validate_ui_answers(ui, answers)
-        elif ui.get("fields"):
-            # structured question exists but no answers object at all
-            validate_ui_answers(ui, {})
-        result_data = dict(data.get("data") or {})
+        fields = evalschema.effective_fields(tdata)
+        raw_data = dict(data.get("data") or {})
+        if fields:
+            # 归一：data.answers.X 与顶层 X → 唯一规范值（冲突拒绝）
+            canon = evalschema.canonicalize_answers(tdata, raw_data)
+            validate_ui_answers({"fields": fields}, canon)
+            result_data = raw_data
+            if evalschema.is_dual_eval(tdata):
+                result_data = evalschema.normalize_canonical(canon)
+                # 保留非表单附属数据（批注/上传引用等）
+                for k, v in raw_data.items():
+                    if k not in ("answers",) and k not in result_data \
+                            and k not in evalschema.DUAL_EVAL_IDS:
+                        result_data[k] = v
+            else:
+                result_data["answers"] = canon
+        else:
+            result_data = raw_data
         args = {"task": task_id,
                 "spec_version": int(data.get("spec_version") or 0)}
         if isinstance(data.get("text"), str) and data.get("text"):

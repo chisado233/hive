@@ -116,6 +116,9 @@ export class Inbox {
       return;
     }
     const t = d.task;
+    // SDEF-02：消费服务端有效表单 schema（与校验同源）
+    t.eval_fields = d.eval_fields || null;
+    t.eval_schema_version = d.eval_schema_version || null;
     this.root.textContent = "";
     // 先建 composer（内容块的批注直接写入其草稿），最后再挂载
     this._composer = new Composer(t, {

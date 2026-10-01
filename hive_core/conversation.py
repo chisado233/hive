@@ -293,6 +293,23 @@ def active_input(svc, agent_id: str):
         (agent_id,)).fetchone()
 
 
+def input_by_request(svc, request_id: str):
+    return svc.store.conn.execute(
+        "SELECT * FROM conv_inputs WHERE request_id=? LIMIT 1",
+        (request_id,)).fetchone()
+
+
+def ensure_turn_started(svc, session_id: str, agent_id: str | None,
+                        input_id: str, source: str):
+    """SDEF-01/RDEF-14：turn.started 幂等写入（DB dedupe，跨重启不重复）。
+    仅在对应输入已真实开始（上游 started 事实或轮次收口）时调用。"""
+    add_conv_event(
+        svc, session_id=session_id, type="turn.started", source=source,
+        agent_id=agent_id, turn_id=f"turn-{input_id}",
+        payload={"input_id": input_id},
+        dedupe_key=f"turn-started-{input_id}")
+
+
 def pending_permission(svc, agent_id: str):
     r = svc.store.conn.execute(
         "SELECT * FROM conv_events WHERE agent_id=? AND type='permission.request' "
