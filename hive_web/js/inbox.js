@@ -21,6 +21,7 @@ export class Inbox {
   }
 
   async render() {
+    document.getElementById("detail").classList.add("open");
     this.root.classList.remove("hidden");
     document.getElementById("detail-empty").classList.add("hidden");
     this.root.textContent = "";

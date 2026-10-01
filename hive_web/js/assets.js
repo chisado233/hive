@@ -15,6 +15,7 @@ export class Assets {
   async open(projectKey, path = "") {
     this.key = projectKey;
     this.path = path;
+    document.getElementById("detail").classList.add("open");
     this.body.classList.remove("hidden");
     document.getElementById("detail-empty").classList.add("hidden");
     this.body.textContent = "";

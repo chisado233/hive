@@ -45,6 +45,7 @@ export class ConversationPane {
     // 头部状态条
     const inst = convInfo?.instance;
     const binding = convInfo?.binding;
+    const ss = convInfo?.session_state;
     const head = el("div", { class: "conv-head" },
       el("span", { class: "conv-dot " + (inst ? "live" : "off") }),
       el("span", { class: "conv-head-name" }, this.agent.name),
@@ -57,13 +58,19 @@ export class ConversationPane {
         : convInfo?.bridge === "acp"
           ? el("span", { class: "tag green" }, "ACP")
           : null,
-      binding ? el("span", { class: "conv-sid" }, shortId(binding.session_id)) : null);
+      ss?.status ? el("span", { class: "tag " + (ss.status === "working" ? "cyan" : "") },
+        `会话 ${ss.status}`) : null,
+      ss?.model ? el("span", { class: "conv-sid", title: "确认模型" },
+        `${ss.model.providerId}/${ss.model.modelId}`) : null,
+      (binding?.session_id || inst?.handle || "").startsWith("sess")
+        ? el("span", { class: "conv-sid" },
+            shortId(binding?.session_id || inst.handle.split(":")[1])) : null);
     this.host.append(head);
 
     // 消息流
     this.flow = el("div", { class: "conv-flow" });
     this.host.append(this.flow);
-    this._renderHistory(convInfo?.tail);
+    this._renderHistory(convInfo?.tail, convInfo);
 
     // 底部：排队指示 + 输入区
     this.queueBar = el("div", { class: "conv-queue hidden" });
@@ -85,16 +92,30 @@ export class ConversationPane {
   }
 
   // ---------------- 历史投影 ----------------
-  _renderHistory(tail) {
+  _renderHistory(tail, convInfo) {
     this.flow.textContent = "";
     this.rowsById.clear();
-    if (!tail || !tail.messages || !tail.messages.length) {
+    const upstream = convInfo?.upstream_history || [];
+    const live = (tail && tail.messages) || [];
+    if (!upstream.length && !live.length) {
       this.flow.append(el("div", { class: "conv-empty" },
-        "暂无会话内容。发送一条消息开始对话；",
+        convInfo?.upstream_error
+          ? `会话历史读取失败：${convInfo.upstream_error}`
+          : "暂无会话内容。发送一条消息开始对话；",
         el("br"), "正式任务请用「发任务」，聊天不会自动生成 work。"));
       return;
     }
-    for (const m of tail.messages) this._appendMessage(m, false);
+    if (upstream.length) {
+      this.flow.append(el("div", { class: "conv-divider" },
+        `ZCode 会话历史（${upstream.length} 条）` +
+        (convInfo?.upstream_note ? ` · ${convInfo.upstream_note}` : "")));
+      for (const m of upstream)
+        this._appendMessage({ ...m, id: "hist-" + Math.random().toString(36).slice(2) },
+          false);
+      if (live.length)
+        this.flow.append(el("div", { class: "conv-divider" }, "—— 本次会话接入后 ——"));
+    }
+    for (const m of live) this._appendMessage(m, false);
     this._scrollBottom(true);
   }
 

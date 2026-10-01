@@ -12,6 +12,7 @@ export class Detail {
   }
 
   show() {
+    document.getElementById("detail").classList.add("open");
     this.body.classList.remove("hidden");
     document.getElementById("detail-empty").classList.add("hidden");
   }
@@ -33,7 +34,7 @@ export class Detail {
   }
 
   // ================= Agent =================
-  async agent(agentId, tab = "概览") {
+  async agent(agentId, tab = "会话") {
     if (tab !== "会话" && this._conv) { this._conv.destroy(); this._conv = null; }
     this.show();
     this.body.textContent = "";
@@ -62,7 +63,7 @@ export class Detail {
         : el("span", { class: "tag" }, "无运行实例"),
       meta.role ? el("span", { class: "tag amber" }, meta.role) : null,
     ].filter(Boolean)));
-    this.body.append(this._tabs(["概览", "会话", "任务", "操作", "事件"], tab,
+    this.body.append(this._tabs(["会话", "概览", "任务", "操作", "事件"], tab,
       t => this.agent(agentId, t)));
     const c = el("div", { class: "dt-content" });
     this.body.append(c);

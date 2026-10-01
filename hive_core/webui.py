@@ -1037,7 +1037,8 @@ class WebUI:
                 "agent_id": agent_id,
                 "instance": ({"instance_id": inst["instance_id"],
                               "generation": inst["generation"],
-                              "phase": inst["phase"]} if inst else None),
+                              "phase": inst["phase"],
+                              "handle": inst["handle"]} if inst else None),
                 "binding": binding,
                 "bridge": (bridge.bridge.name if bridge else None),
                 "bridge_connected": bool(
@@ -1050,6 +1051,26 @@ class WebUI:
                 "pending_permission": conv.pending_permission(
                     self.svc, agent_id),
             }
+            # 上游历史：实例的真实 ZCode 会话内容（含绑定前的历史），
+            # 与桥捕获的增量（conv_events，绑定后）按时间水印拼接
+            session_id = (binding or {}).get("session_id")
+            if not session_id and inst and (inst["handle"] or "").startswith("sess:"):
+                session_id = inst["handle"].split(":", 1)[1]
+            if session_id:
+                from . import zsession_read as zr
+                try:
+                    data["session_state"] = zr.fetch_session_state(
+                        self.svc, session_id)
+                except HiveError as e:
+                    data["session_state_error"] = e.message
+                try:
+                    hist = zr.fetch_session_history(self.svc, session_id)
+                    watermark = (binding or {}).get("created_at")
+                    data["upstream_history"] = hist["messages"]
+                    data["upstream_note"] = hist.get("note")
+                    data["upstream_watermark"] = watermark
+                except HiveError as e:
+                    data["upstream_error"] = e.message
             if binding:
                 proj = conv.project_messages(self.svc, binding["session_id"],
                                              limit=120)

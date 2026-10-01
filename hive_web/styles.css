@@ -238,10 +238,15 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 
 /* ---------------- detail panel ---------------- */
 .detail {
-  width: var(--detail-w); flex: none; background: var(--glass);
-  backdrop-filter: blur(10px);
-  border-left: 1px solid var(--line); display: flex; flex-direction: column;
-  min-height: 0; box-shadow: -12px 0 40px rgba(2,6,18,.4);
+  flex: none; width: 0; min-width: 0; overflow: hidden; visibility: hidden;
+  background: var(--glass); backdrop-filter: blur(10px);
+  display: flex; flex-direction: column; min-height: 0;
+  transition: width .24s ease, min-width .24s ease, visibility .24s;
+}
+.detail.open {
+  width: min(62%, 1000px); min-width: 560px; visibility: visible;
+  border-left: 1px solid var(--line);
+  box-shadow: -12px 0 40px rgba(2,6,18,.4);
 }
 .detail-empty {
   flex: 1; display: flex; flex-direction: column; align-items: center;
@@ -518,13 +523,12 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 }
 @media (max-width: 980px) {
   .sidenav { display: none; }
-  .detail {
+  .detail.open {
     position: fixed; left: 0; right: 0; bottom: 0; top: auto;
-    width: auto; height: 62vh; z-index: 60;
+    width: auto; min-width: 0; height: 62vh; z-index: 60;
     border-left: none; border-top: 1px solid var(--line-strong);
-    box-shadow: var(--shadow-3); transform: translateY(0);
+    box-shadow: var(--shadow-3);
   }
-  .detail:has(.detail-body.hidden) { display: none; }
 }
 
 /* ---------------- 会话舱 ---------------- */
@@ -588,3 +592,11 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 .tool-detail { display: none; border-top: 1px solid var(--line); padding: 8px 10px; }
 .tool-card.open .tool-detail { display: block; }
 .tool-detail pre { white-space: pre-wrap; font-size: 11px; max-height: 200px; overflow: auto; }
+
+/* 会话历史分隔 */
+.conv-divider {
+  text-align: center; color: var(--text-3); font-size: 10.5px;
+  letter-spacing: .08em; padding: 8px 0 2px; user-select: none;
+}
+.conv-divider::before, .conv-divider::after { content: "—"; opacity: .4; margin: 0 8px; }
+.conv-msg[data-source="history"] .conv-msg-body { opacity: .82; }

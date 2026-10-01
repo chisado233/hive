@@ -263,21 +263,31 @@ function describeEvent(e) {
 }
 
 // ---------------- 选择路由 ----------------
+function openPanel() {
+  document.getElementById("detail").classList.add("open");
+}
+
 function onSelect(sel) {
   select(sel);
   if (!sel) { closeDetail(); return; }
+  openPanel();
   if (sel.kind === "agent") detail.agent(sel.id.split(":")[1]);
   else if (sel.kind === "human") openInbox();
   else if (sel.kind === "asset") assets.open(sel.id.split(":")[1]);
   else if (sel.kind === "port") detail.port(sel.id);
   else if (sel.kind === "edge") detail.edge(sel);
+  // 面板展开后星图收缩；选中节点保持在可视中心（保留图上上下文）
+  if (["agent", "asset", "human", "port"].includes(sel.kind))
+    setTimeout(() => graph.centerOn(sel.id), 270);
 }
 
 function openInbox() {
+  openPanel();
   inbox.render();
 }
 
 function closeDetail() {
+  document.getElementById("detail").classList.remove("open");
   $("#detail-body").classList.add("hidden");
   $("#detail-empty").classList.remove("hidden");
   select(null);
