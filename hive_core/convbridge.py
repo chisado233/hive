@@ -807,8 +807,36 @@ class ConversationService:
 
     def _fail_input(self, agent_id: str, inp, e: HiveError):
         """失败落账（RDEF-01：输入身份由调用方传入，绝不重新猜测）。
-        忙冲突=回队重试；已登记 rejected=派生新 requestId 重置被污染的预约；
-        超时/断线=结果未知（不盲目重放）；其余=failed。"""
+        TDEF-02：本函数自身必须在任何存储/上游异常下可靠落账——
+        全函数兜底，绝不让异常处理器抛出第二个异常把输入永卡 dispatched。"""
+        try:
+            self._fail_input_inner(agent_id, inp, e)
+        except Exception as e2:  # noqa: BLE001
+            # 落账自身失败（存储/上游查询）：至少保证 _working 释放与
+            # 诊断可见，输入保持原状态等待 reconcile；不盲重发
+            self.svc.logger.error(
+                "conv.fail_input_broken", agent=agent_id,
+                original=repr(e)[:200], handler_error=repr(e2)[:300])
+            try:
+                iid = inp["input_id"] if inp is not None and "input_id" in inp.keys()                     else None
+                if iid:
+                    conv.set_input_state(self.svc, iid, "outcome_unknown",
+                                         error=f"落账异常: {repr(e2)[:200]}")
+            except Exception:  # noqa: BLE001
+                self.svc.logger.critical("conv.fail_input_lost",
+                                         agent=agent_id, iid=str(iid))
+
+    def _fail_input_inner(self, agent_id: str, inp, e: HiveError):
+        # TDEF-02：边界统一类型契约——sqlite3.Row → dict（Row 无 .get）
+        if inp is not None and not isinstance(inp, dict):
+            try:
+                inp = dict(inp)
+            except (TypeError, ValueError):
+                inp = None
+        """失败落账：忙冲突=回队重试（排队由 Hive 决策）；
+        已登记 rejected=派生新 requestId 重置被污染的预约（旧上游兼容，
+        新合同 retryable_busy 不触发）；超时/断线=结果未知（不盲目重放）；
+        其余=failed。"""
         upstream_code = ((getattr(e, "details", {}) or {}).get("upstream") or {}) \
             .get("code")
         if upstream_code == -32011:
@@ -818,7 +846,7 @@ class ConversationService:
                 # RDEF-01 未修）——重试会命中终态短路假成功。先查持久状态；
                 # 被污染则派生新 requestId（保留血缘），否则原 id 回队。
                 poisoned = False
-                if hasattr(self.bridge, "query_input_state") and inp.get("session_id"):
+                if hasattr(self.bridge, "query_input_state") and inp.get("session_id"):  # dict 边界已转
                     st = self.bridge.query_input_state(
                         inp["session_id"], inp["request_id"])
                     if st.get("state") == "rejected":

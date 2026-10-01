@@ -1009,19 +1009,27 @@ class WebUI:
         fields = evalschema.effective_fields(tdata)
         raw_data = dict(data.get("data") or {})
         if fields:
-            # 归一：data.answers.X 与顶层 X → 唯一规范值（冲突拒绝）
-            canon = evalschema.canonicalize_answers(tdata, raw_data)
+            # TDEF-03：显式 fields 与兜底同规则归一（顶层/answers 双表示）
+            canon = evalschema.canonicalize_answers(tdata, raw_data, fields)
             validate_ui_answers({"fields": fields}, canon)
-            result_data = raw_data
+            # TDEF-04：规范结果白名单——schema 声明字段 + 契约键；未声明
+            # 顶层键（grant/authorize/_verified 等）不回填。显式跟踪
+            # metadata 白名单：video_notes/image_notes/ui_attachments。
+            result_data = evalschema.canonical_result(tdata, canon, fields)
+            for k in ("video_notes", "image_notes", "ui_attachments"):
+                if k in raw_data:
+                    result_data[k] = raw_data[k]
+            if not evalschema.is_dual_eval(tdata):
+                # 显式非双评表单：保留 answers 包装形态（前端按 fields 读）
+                result_data = {"answers": result_data}
+                for k in ("video_notes", "image_notes", "ui_attachments"):
+                    if k in raw_data:
+                        result_data[k] = raw_data[k]
+            # 契约 null 键（双评）：显式补齐未评分=null
             if evalschema.is_dual_eval(tdata):
-                result_data = evalschema.normalize_canonical(canon)
-                # 保留非表单附属数据（批注/上传引用等）
-                for k, v in raw_data.items():
-                    if k not in ("answers",) and k not in result_data \
-                            and k not in evalschema.DUAL_EVAL_IDS:
-                        result_data[k] = v
-            else:
-                result_data["answers"] = canon
+                for k in ("artifact_score", "review_score", "artifact_decision",
+                          "review_decision", "explicit_autonomy_grant"):
+                    result_data.setdefault(k, None)
         else:
             result_data = raw_data
         args = {"task": task_id,

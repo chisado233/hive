@@ -97,3 +97,20 @@ control test *、system 管理类、permission grant/revoke 等不在白名单�
   残留 claim，防旧凭据锁死。
 - **登录竞态**：认证请求代次守卫 + enterApp 幂等 + auth-lost 双确认；
   HttpOnly cookie 语义不变。
+
+## 7. 第四轮修订（TDEF 修复后）
+
+- **答复表示归一（显式与兜底同规则）**：归一字段集 = effective_fields
+  声明的全部字段 ID（显式表单的 name/rating/date 等顶层表示同样参与，
+  不再仅双评白名单）；同键两处同值合并、异值 400 冲突。
+- **结构化结果白名单**：result 只含 schema 声明字段 + 契约键
+  （explicit_autonomy_grant）+ 跟踪 metadata（video_notes/image_notes/
+  ui_attachments）；未声明键（grant/authorize/_verified 等）不回填。
+  普通自由 data 任务不受影响。显式非双评表单保持 {answers:{…}} 包装。
+- **强 writer 模式**：HIVE_ACP_WRITER_KEY=1 启用（上游四修后 adapter
+  正确转发 X-ZS-Writer-Key）。每 agent+generation 高熵 key（服务端文件，
+  Windows 无 POSIX 0600——实际保护为 NTFS ACL+本机边界）；claim 绑定
+  sha256 核实；无 key/错 key 409，owner 直通保留；重启同代际接续。
+  弱模式（默认）ensure 前自动释放本方残留 claim（兼容路径，强模式不触发）。
+- **busy 合同**：-32011 → 同 requestId 回队（10s 退避）；新合同
+  retryable_busy 非终态，不触发派生 ID；不假 turn.started、不自动 interrupt。

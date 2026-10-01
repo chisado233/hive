@@ -79,14 +79,22 @@ def effective_fields(task_data: dict) -> list[dict] | None:
     return None
 
 
-def canonicalize_answers(task_data: dict, data: dict) -> dict:
-    """把两种答复表示（data.answers.X 与顶层 X）解析为唯一规范值。
-    同键两处都有且不同 → 400 冲突；相同 → 合法。"""
+def canonicalize_answers(task_data: dict, data: dict,
+                         fields: list[dict] | None = None) -> dict:
+    """TDEF-03：以有效 schema 的全部声明字段 ID 统一解析两种答复表示
+    （data.answers.<field> 与 data.<field>）——显式 fields 与兜底同规则，
+    不再只用 DUAL_EVAL_IDS 白名单（显式表单的 name/rating/date 等同样归一）。
+    同键两处且不同 → 400 冲突；相同 → 合法。"""
+    if fields is None:
+        fields = effective_fields(task_data) or []
+    ids = {f.get("id") for f in fields if f.get("id")}
+    # 自主授权对象（显式双评契约键）始终参与归一
+    if is_dual_eval(task_data):
+        ids.add("explicit_autonomy_grant")
     answers = {}
     if isinstance(data, dict) and isinstance(data.get("answers"), dict):
         answers = dict(data["answers"])
-    top = {k: v for k, v in (data or {}).items()
-           if k in DUAL_EVAL_IDS} if is_dual_eval(task_data) else {}
+    top = {k: v for k, v in (data or {}).items() if k in ids}
     canon = dict(answers)
     for k, v in top.items():
         if k in answers and answers[k] != v:
@@ -94,11 +102,44 @@ def canonicalize_answers(task_data: dict, data: dict) -> dict:
                             f"字段 {k} 在 answers 与顶层同时出现且取值不同",
                             {"field_errors": [f"{k}: 两处取值冲突"]})
         canon[k] = v
-    # explicit_autonomy_grant 只认显式对象
     if isinstance(data, dict) and isinstance(
             data.get("explicit_autonomy_grant"), dict):
         canon["explicit_autonomy_grant"] = data["explicit_autonomy_grant"]
     return canon
+
+
+def canonical_result(task_data: dict, canon: dict,
+                     fields: list[dict] | None = None) -> dict:
+    """TDEF-04：结构化表单的结果合同——只保留 schema 声明字段的规范值 +
+    显式契约键（explicit_autonomy_grant）。未声明键（grant/authorize/
+    _verified 等）一律不进规范结果；普通自由 data 任务不经此函数，
+    合法业务 metadata 不受影响。"""
+    if fields is None:
+        fields = effective_fields(task_data) or []
+    ids = {f.get("id") for f in fields if f.get("id")}
+    ids |= DUAL_EVAL_IDS if is_dual_eval(task_data) else set()
+    ids.add("explicit_autonomy_grant")
+    out = {}
+    for k, v in canon.items():
+        if k not in ids:
+            continue
+        if k in DUAL_LIST_FIELDS:
+            out[k] = (str(v).split("\n") if isinstance(v, str) else
+                      list(v) if isinstance(v, list) else [])
+            out[k] = [x.strip() for x in out[k] if x and x.strip()]
+        elif k == "explicit_autonomy_grant":
+            g = v if isinstance(v, dict) else None
+            if g and g.get("grant") is True and (g.get("scope") or "").strip():
+                out[k] = g
+            else:
+                out[k] = None
+        elif isinstance(v, dict) and "choice" in v:
+            out[k] = v["choice"]
+            if isinstance(v.get("text"), str) and v["text"].strip():
+                out[k + "_note"] = v["text"].strip()
+        else:
+            out[k] = v
+    return out
 
 
 def normalize_canonical(canon: dict) -> dict:
