@@ -322,10 +322,7 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 .md ul, .md ol { margin: 6px 0 6px 22px; }
 .md li { margin: 3px 0; }
 .md code { background: var(--bg-3); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-.md pre { background: #101318; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 12px; overflow-x: auto; margin: 8px 0; position: relative; }
-.md pre code { background: none; padding: 0; }
-.md pre .copy-btn { position: absolute; top: 6px; right: 6px; opacity: 0; transition: opacity .15s; }
-.md pre:hover .copy-btn { opacity: 1; }
+.md pre { margin: 8px 0; overflow-x: auto; }
 .md blockquote { border-left: 3px solid var(--line-strong); padding: 2px 12px; margin: 8px 0; color: var(--text-1); }
 .md table { border-collapse: collapse; margin: 8px 0; font-size: 12.5px; }
 .md th, .md td { border: 1px solid var(--line-strong); padding: 5px 10px; text-align: left; }
@@ -551,7 +548,8 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 .conv-empty { color: var(--text-3); text-align: center; padding: 40px 16px; font-size: 12px; }
 .conv-msg { display: flex; flex-direction: column; gap: 3px; max-width: 94%; }
 .conv-user { align-self: flex-end; align-items: flex-end; }
-.conv-assistant, .conv-thought, .conv-tool, .conv-system, .conv-permission { align-self: flex-start; }
+.conv-assistant, .conv-thought, .conv-tool, .conv-system, .conv-permission { align-self: stretch; }
+.zc-code { width: 100%; }
 .conv-msg-who { display: flex; gap: 8px; align-items: baseline; font-size: 11px; color: var(--text-2); }
 .conv-msg-at { color: var(--text-3); font-size: 10.5px; }
 .conv-streaming { color: var(--cyan); animation: blink 1s steps(1) infinite; }
@@ -561,9 +559,13 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
   padding: 8px 12px; border-radius: 10px; font-size: 12.5px; line-height: 1.6;
   overflow-wrap: break-word;
 }
-.conv-user .conv-msg-body { background: var(--cyan-dim); border: 1px solid rgba(122,221,240,.22); color: var(--text-0); }
-.conv-assistant .conv-msg-body { background: var(--bg-2); border: 1px solid var(--line); }
-.conv-thought .conv-msg-body { background: transparent; border: 1px dashed var(--line-strong); color: var(--text-2); font-style: italic; }
+.conv-user .conv-msg-body {
+  background: rgba(255,255,255,.05); border: 1px solid var(--line);
+  border-radius: 12px; border-top-right-radius: 4px;
+  padding: 10px 14px; color: var(--text-0); max-width: 36rem;
+}
+.conv-assistant .conv-msg-body { background: transparent; border: none; padding: 2px 0; }
+.conv-msg-body { padding: 8px 12px; }
 .conv-system .conv-msg-body { background: transparent; color: var(--text-2); font-size: 11.5px; padding: 2px 8px; }
 .conv-queue {
   padding: 5px 14px; border-top: 1px solid var(--line); font-size: 11px;
@@ -600,3 +602,130 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 }
 .conv-divider::before, .conv-divider::after { content: "—"; opacity: .4; margin: 0 8px; }
 .conv-msg[data-source="history"] .conv-msg-body { opacity: .82; }
+
+/* ---------------- ZCode web 形态：代码块/工具行/思考区 ---------------- */
+.zc-code {
+  margin: 12px 0; border: 1px solid var(--line); border-radius: 12px;
+  background: #0d1830; overflow: hidden;
+}
+.zc-code-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px 4px; color: var(--text-2);
+}
+.zc-code-lang { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; }
+.zc-code-lang .mono { text-transform: lowercase; color: var(--text-2); }
+.zc-code-actions { display: inline-flex; gap: 2px; }
+.zc-icon-btn {
+  width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 7px; color: var(--text-2); transition: background .12s, color .12s;
+}
+.zc-icon-btn:hover { background: rgba(255,255,255,.06); color: var(--text-0); }
+.zc-icon-btn.done { color: var(--green); }
+.zc-code-body {
+  margin: 0; padding: 4px 12px 12px; font-size: 12px; line-height: 1.65;
+  overflow-x: auto; white-space: pre; background: transparent; border: none;
+}
+.zc-code-body.wrap { white-space: pre-wrap; }
+.zc-code-body code { background: none; padding: 0; }
+
+/* 运行中/思考中的渐变微光（ZCode animated-gradient-text 等价） */
+.shimmer {
+  display: inline-block;
+  background: linear-gradient(90deg, rgba(230,237,248,1) 0%, rgba(230,237,248,1) 34%,
+    rgba(230,237,248,.25) 50%, rgba(230,237,248,1) 66%, rgba(230,237,248,1) 100%);
+  background-size: 300% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+  animation: zc-flow 4s linear infinite;
+}
+@keyframes zc-flow { 0% { background-position: 100% 0; } 50% { background-position: 0% 0; } 100% { background-position: 0% 0; } }
+
+/* 工具行：无卡片边框的单行摘要 */
+.zc-tool { align-self: stretch; }
+.zc-tool-row {
+  display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
+  padding: 3px 6px 3px 2px; border-radius: 7px; cursor: pointer;
+  color: var(--text-2); font-size: 12.5px; text-align: left;
+}
+.zc-tool-row:hover { background: rgba(255,255,255,.04); }
+.zc-tool-icon { width: 16px; text-align: center; color: var(--text-2); flex: none; filter: grayscale(1); }
+.zc-tool-kind { font-weight: 600; color: var(--text-2); white-space: nowrap; flex: none; font-family: var(--mono); font-size: 11.5px; }
+.zc-tool-title {
+  color: var(--text-2); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0; font-family: var(--mono); font-size: 11.5px;
+}
+.zc-tool-fail {
+  color: var(--red); white-space: nowrap; text-decoration: underline dotted;
+  text-underline-offset: 3px; cursor: help;
+}
+.zc-tool-chev {
+  color: var(--text-3); opacity: 0; transition: opacity .15s, transform .15s;
+  font-size: 13px; flex: none;
+}
+.zc-tool-row:hover .zc-tool-chev, .zc-tool-row.open .zc-tool-chev { opacity: 1; }
+.zc-tool-row.open .zc-tool-chev { transform: rotate(90deg); }
+.zc-tool-detail {
+  display: none; margin: 4px 0 8px 8px; padding-left: 14px;
+  border-left: 1px solid var(--line-strong);
+}
+.zc-tool-detail.open { display: block; }
+.zc-sec { margin: 6px 0; }
+.zc-sec-h {
+  font-size: 10.5px; letter-spacing: .1em; color: var(--text-3);
+  text-transform: uppercase; margin-bottom: 4px;
+}
+.zc-sec-body {
+  background: rgba(255,255,255,.04); border-radius: 8px; padding: 8px 10px;
+  max-height: 240px; overflow: auto; white-space: pre-wrap; font-size: 11.5px;
+  color: var(--text-1);
+}
+.zc-sec-body.zc-err { background: var(--red-dim); color: #f0bcbc; }
+
+/* 思考区：默认折叠，左侧轨线 */
+.zc-think { align-self: stretch; }
+.zc-think-row {
+  display: inline-flex; align-items: center; gap: 7px; padding: 2px 6px 2px 2px;
+  color: var(--text-3); font-size: 12px; border-radius: 7px; cursor: pointer;
+}
+.zc-think-row:hover { background: rgba(255,255,255,.04); }
+.zc-think-label { font-weight: 500; }
+.zc-think-dur { color: var(--text-3); }
+.zc-think-row .zc-tool-chev { font-size: 13px; }
+.zc-think-row.open .zc-tool-chev { opacity: 1; transform: rotate(90deg); }
+.zc-think-body { display: none; margin: 4px 0 8px 8px; }
+.zc-think-body.open { display: block; }
+.zc-think-text {
+  max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: break-word;
+  color: var(--text-2); font-size: 12px; padding-left: 14px;
+  border-left: 1px solid var(--line-strong);
+}
+
+/* Markdown 细化（对齐 ZCode web） */
+.md h1 { font-size: 17px; font-weight: 600; margin: 16px 0 10px; }
+.md h2 { font-size: 15.5px; font-weight: 600; margin: 16px 0 10px; }
+.md h3, .md h4 { font-size: 13.5px; font-weight: 600; margin: 14px 0 8px; }
+.md strong { font-weight: 600; }
+.md code {
+  background: rgba(255,255,255,.08); border-radius: 5px;
+  margin: 0 2px; padding: 1px 5px; font-size: 11.5px;
+}
+.md pre code { background: none; margin: 0; padding: 0; font-size: 12px; }
+.md ul { list-style: disc outside; padding-left: 20px; margin: 8px 0; }
+.md ul li, .md ol li { margin: 4px 0; padding-left: 4px; }
+.md blockquote {
+  border-left: 2px solid var(--line-strong); padding: 2px 12px;
+  margin: 12px 0; color: var(--text-1);
+}
+.md table {
+  border: 1px solid var(--line); border-radius: 12px; border-collapse: separate;
+  border-spacing: 0; overflow: hidden; margin: 12px 0; font-size: 12.5px;
+}
+.md th, .md td {
+  border: none; border-bottom: 1px solid var(--line); padding: 7px 12px;
+  text-align: left; vertical-align: top;
+}
+.md tr:last-child td { border-bottom: none; }
+.md th { background: rgba(255,255,255,.04); font-weight: 500; color: var(--text-2); }
+.md tr:hover td { background: rgba(255,255,255,.02); }
+.md a { text-decoration: underline dotted; text-underline-offset: 3px; font-weight: 500; }
+.md a:hover { text-decoration-style: solid; }

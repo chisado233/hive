@@ -907,8 +907,8 @@ class WebUI:
             if rel == "session":
                 data = self._read_json(body)
                 sid, subject = create_session(self.svc, data.get("token") or "")
-                cookie = (f"{SESSION_COOKIE}={sid}; Path=/ui; HttpOnly; "
-                          f"SameSite=Strict")
+                cookie = (f"{SESSION_COOKIE}={sid}; Path=/ui; HttpOnly; SameSite=Strict; "
+                          f"Max-Age={SESSION_TTL_SECONDS}")
                 self._json(h, 200, {"ok": True, "subject": subject.to_dict(),
                                     "ref": subject.ref},
                            {"Set-Cookie": cookie})

@@ -1,6 +1,44 @@
 // 安全 Markdown 渲染：全部经 DOM 构建，不注入 HTML，不执行任何脚本/事件
 import { el } from "./util.js";
 
+const SVG_FILE = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+const SVG_COPY = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const SVG_CHECK = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+const SVG_WRAP = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-4"/><path d="m14 16-2 2 2 2"/></svg>';
+
+const LANG_LABEL = {
+  py: "python", js: "javascript", ts: "typescript", json: "json",
+  sh: "shell", bash: "shell", md: "markdown", yaml: "yaml", yml: "yaml",
+  html: "html", css: "css", sql: "sql", txt: "text", "": "text",
+};
+
+export function codeBlock(codeText, lang) {
+  const label = LANG_LABEL[lang] || lang || "text";
+  const wrap = el("div", { class: "zc-code" });
+  const head = el("div", { class: "zc-code-head" });
+  const title = el("span", { class: "zc-code-lang" });
+  title.innerHTML = SVG_FILE;
+  title.append(el("span", { class: "mono" }, label));
+  const actions = el("span", { class: "zc-code-actions" });
+  const pre = el("pre", { class: "zc-code-body" }, el("code", {}, codeText));
+  const wrapBtn = el("button", { class: "zc-icon-btn", title: "自动换行" });
+  wrapBtn.innerHTML = SVG_WRAP;
+  wrapBtn.onclick = (e) => { e.stopPropagation(); pre.classList.toggle("wrap"); };
+  const copyBtn = el("button", { class: "zc-icon-btn", title: "复制" });
+  copyBtn.innerHTML = SVG_COPY;
+  copyBtn.onclick = (e) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(codeText);
+    copyBtn.innerHTML = SVG_CHECK;
+    copyBtn.classList.add("done");
+    setTimeout(() => { copyBtn.innerHTML = SVG_COPY; copyBtn.classList.remove("done"); }, 2000);
+  };
+  actions.append(wrapBtn, copyBtn);
+  head.append(title, actions);
+  wrap.append(head, pre);
+  return wrap;
+}
+
 const INLINE_RE = /(\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\[[^\]\n]+\]\([^)\n]+\)|__[^_]+__|~~[^~]+~~)/g;
 
 function inline(text, parent) {
@@ -49,24 +87,15 @@ export function renderMarkdown(src) {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    // 代码块
-    if (/^```/.test(line)) {
+    // 代码块（ZCode web 形态：圆角卡片 + 头部语言标签 + 换行/复制钮）
+    const fence = line.match(/^```(\w*)\s*$/);
+    if (fence) {
+      const lang = (fence[1] || "").toLowerCase();
       const buf = [];
       i++;
       while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
       i++;
-      const pre = el("pre");
-      const code = el("code", {}, buf.join("\n"));
-      const btn = el("button", {
-        class: "btn btn-ghost btn-sm copy-btn", title: "复制代码",
-        onclick: (e) => {
-          e.stopPropagation();
-          navigator.clipboard.writeText(buf.join("\n"));
-          btn.textContent = "已复制"; setTimeout(() => btn.textContent = "复制", 1200);
-        },
-      }, "复制");
-      pre.append(code, btn);
-      root.append(pre);
+      root.append(codeBlock(buf.join("\n"), lang));
       continue;
     }
     // 表格

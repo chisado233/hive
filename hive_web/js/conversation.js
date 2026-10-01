@@ -125,18 +125,24 @@ export class ConversationPane {
       const exist = this.rowsById.get(m.id);
       const body = exist.querySelector(".conv-msg-body");
       if (body) { body.textContent = ""; body.append(renderMarkdown(m.text || "")); }
+      const thinkText = exist.querySelector(".zc-think-text");
+      if (thinkText) { thinkText.textContent = m.text || ""; this._thinkScroll(exist); }
       exist.dataset.state = m.state || "streaming";
+      const lbl = exist.querySelector(".zc-think-label");
+      if (lbl && m.state === "completed") { lbl.textContent = "思考"; lbl.classList.remove("shimmer"); }
       this._maybeScroll();
       return;
     }
     const row = el("div", { class: `conv-msg conv-${m.kind}`,
-      dataset: { state: m.state || "" } });
+      dataset: { state: m.state || "", source: m.source || "" } });
     const who = { user: "你", assistant: this.agent.name.split("·").pop().trim(),
       thought: "思考", tool: "工具", system: "系统", permission: "权限" }[m.kind] || m.kind;
     if (m.kind === "tool") {
       row.append(this._toolCard(m));
     } else if (m.kind === "permission") {
       row.append(this._permissionCard(m));
+    } else if (m.kind === "thought") {
+      row.append(this._thinkCard(m));
     } else {
       row.append(el("div", { class: "conv-msg-who" },
         el("span", {}, who),
@@ -144,7 +150,7 @@ export class ConversationPane {
         m.state === "streaming" ? el("span", { class: "conv-streaming" }, "▍") : null,
         m.replay ? el("span", { class: "conv-replay" }, "重放") : null));
       const body = el("div", { class: "conv-msg-body" });
-      if (m.kind === "assistant" || m.kind === "thought")
+      if (m.kind === "assistant")
         body.append(renderMarkdown(m.text || ""));
       else body.textContent = m.text || "";
       row.append(body);
@@ -154,20 +160,77 @@ export class ConversationPane {
     this._maybeScroll();
   }
 
+  _thinkScroll(rowEl) {
+    const area = rowEl.querySelector(".zc-think-body.open");
+    if (area) area.scrollTop = area.scrollHeight;
+  }
+
   _toolCard(m) {
-    const stateIcon = { pending: "⏳", running: "⚙️", completed: "✓",
-      failed: "✗", cancelled: "⊘" }[m.state] || "⚙️";
-    const card = el("div", { class: `tool-card tool-${m.state}` },
-      el("div", { class: "tool-head", onclick: () => card.classList.toggle("open") },
-        el("span", { class: "tool-icon" }, stateIcon),
-        el("span", { class: "tool-name" }, m.tool || "tool"),
-        m.title ? el("span", { class: "tool-title" }, m.title) : null,
-        el("span", { class: "tool-state" }, m.state)),
-      el("div", { class: "tool-detail" },
-        m.args ? el("pre", { class: "mono" }, typeof m.args === "string" ? m.args : JSON.stringify(m.args, null, 1)) : null,
-        m.result != null ? el("pre", { class: "mono" }, typeof m.result === "string" ? m.result : JSON.stringify(m.result, null, 1)) : null,
-        m.error ? el("div", { class: "field-err" }, m.error) : null));
-    return card;
+    // ZCode web 形态：无卡片边框的单行摘要（图标+类别+内容摘要+状态+悬停出现的箭头），
+    // 点击展开参数/结果详情；运行中类别标签带渐变微光
+    const icons = {
+      execute: "⌘", bash: "⌘", terminal: "⌘", read: "📄", edit: "✎",
+      write: "✎", glob: "⌕", grep: "⌕", web: "⌁", task: "⧉", fallback: "⚙",
+    };
+    const name = m.tool || "tool";
+    const low = name.toLowerCase();
+    const icon = icons[Object.keys(icons).find(k => low.includes(k)) || "fallback"];
+    const running = m.state === "running";
+    const failed = m.state === "failed";
+    // 摘要：JSON 参数提炼为可读形态（command/description/file_path），截断 100
+    let summary = m.title || "";
+    if (summary.includes(":")) summary = summary.split(":").slice(1).join(":").trim();
+    if (summary.startsWith("{")) {
+      try {
+        const j = JSON.parse(summary.replace(/\n/g, " "));
+        summary = j.command || j.description || j.file_path || j.path ||
+                  JSON.stringify(j);
+      } catch { /* 保留原文 */ }
+    }
+    if (summary.length > 100) summary = summary.slice(0, 100) + "…";
+    const row = el("button", { class: "zc-tool-row" },
+      el("span", { class: "zc-tool-icon" }, icon),
+      el("span", { class: "zc-tool-kind" + (running ? " shimmer" : "") }, name),
+      summary ? el("span", { class: "zc-tool-title" }, summary) : null,
+      failed ? el("span", { class: "zc-tool-fail", title: m.error || "执行失败" }, "failed") : null,
+      el("span", { class: "zc-tool-chev" }, "›"));
+    const detail = el("div", { class: "zc-tool-detail" },
+      m.args != null ? el("div", { class: "zc-sec" },
+        el("div", { class: "zc-sec-h" }, "参数"),
+        el("pre", { class: "mono zc-sec-body" },
+          typeof m.args === "string" ? m.args : JSON.stringify(m.args, null, 1))) : null,
+      m.result != null ? el("div", { class: "zc-sec" },
+        el("div", { class: "zc-sec-h" }, "结果"),
+        el("pre", { class: "mono zc-sec-body" },
+          typeof m.result === "string" ? m.result : JSON.stringify(m.result, null, 1))) : null,
+      m.error ? el("div", { class: "zc-sec" },
+        el("div", { class: "zc-sec-h" }, "错误"),
+        el("pre", { class: "mono zc-sec-body zc-err" }, m.error)) : null);
+    row.onclick = () => {
+      const open = detail.classList.toggle("open");
+      row.classList.toggle("open", open);
+    };
+    return el("div", { class: "zc-tool", dataset: { state: m.state } }, row, detail);
+  }
+
+  _thinkCard(m) {
+    // ZCode web 形态：默认折叠的思考区（Brain 图标 + “思考”，展开后左侧轨线滚动区）
+    const secs = m.duration != null && m.duration >= 1
+      ? el("span", { class: "zc-think-dur" }, `· ${Math.round(m.duration)}s`) : null;
+    const row = el("button", { class: "zc-think-row" },
+      el("span", { class: "zc-tool-icon" }, "🧠"),
+      el("span", { class: m.state === "streaming" ? "shimmer zc-think-label"
+        : "zc-think-label" },
+        m.state === "streaming" ? "思考中…" : "思考"),
+      secs,
+      el("span", { class: "zc-tool-chev" }, "›"));
+    const body = el("div", { class: "zc-think-body" },
+      el("div", { class: "zc-think-text" }, m.text || ""));
+    row.onclick = () => {
+      const open = body.classList.toggle("open");
+      row.classList.toggle("open", open);
+    };
+    return el("div", { class: "zc-think" }, row, body);
   }
 
   _permissionCard(m) {

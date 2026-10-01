@@ -122,8 +122,8 @@ class AcpBridge:
         self.last_error: str | None = None
         # adapter 进程内已 track 的会话（断线重启后必须重新 session/load）
         self._loaded_sessions: set[str] = set()
-        # 会话内消息分组计数（上游 chunk 无 rowId，按会话+序号聚合）
-        self._msg_seq: dict[str, int] = {}
+        self._boot_ts = time.monotonic()
+        self._turn_row: dict[str, dict] = {}
 
     # ---------------- lifecycle ----------------
     def start(self):
@@ -306,11 +306,9 @@ class AcpBridge:
         base = {"session_id": sid, "source": "acp", "agent_id": agent_id,
                 "upstream_seq": meta.get("seq")}
         if kind == "user_message_chunk":
-            # 新一轮用户输入：递增消息分组
-            n = self._msg_seq.get(sid, 0) + 1
-            self._msg_seq[sid] = n
+            # 新一轮用户输入
             conv.add_conv_event(
-                self.svc, type="user.message", row_id=f"msg-{sid}-{n}",
+                self.svc, type="user.message",
                 payload={"text": (upd.get("content") or {}).get("text", ""),
                          "source": "user"}, **base)
         elif kind == "agent_message_chunk":
@@ -345,14 +343,30 @@ class AcpBridge:
                 payload=payload, **base)
 
     def _current_row(self, sid: str, prefix: str) -> str:
+        # 行 id 绑定到持久 input_id（跨重启稳定）；无活动轮次时用
+        # 本进程启动时间戳兜底（绝不与历史行碰撞合并）
         key = f"_row_{prefix}_{sid}"
         row = getattr(self, key, None)
-        if not row:
-            n = self._msg_seq.get(sid, 0) + 1
-            self._msg_seq[sid] = n
-            row = f"{prefix}-{sid}-{n}"
-            setattr(self, key, row)
+        if row:
+            return row
+        turn = getattr(self, "_turn_row", {}).get(sid)
+        if turn:
+            row = turn[prefix]
+        else:
+            row = f"{prefix}-{sid}-live-{int(self._boot_ts)}"
+        setattr(self, key, row)
         return row
+
+    def begin_turn(self, sid: str, input_id: str):
+        """派发开始时登记本轮行分组：msg/thd 行 id 由持久 input_id 派生。"""
+        if not hasattr(self, "_turn_row"):
+            self._turn_row = {}
+        self._turn_row[sid] = {"msg": f"msg-{input_id}", "thd": f"thd-{input_id}"}
+        for prefix in ("msg", "thd"):
+            try:
+                delattr(self, f"_row_{prefix}_{sid}")
+            except AttributeError:
+                pass
 
     def finalize_turn(self, sid: str, state: str = "completed"):
         """轮次收口：当前消息/思考行落终态，行分组重置（下一轮起新行）。"""
@@ -515,18 +529,35 @@ class ConversationService:
                 raise HiveError("UPSTREAM_UNSUPPORTED", "会话绑定缺少 session_id")
             conv.set_input_state(self.svc, inp["input_id"], "dispatched",
                                  session_id=binding["session_id"])
+            sid = binding["session_id"]
+            turn_id = f"turn-{inp['input_id']}"
+            has_turn_api = hasattr(self.bridge, "begin_turn")
+            if has_turn_api:
+                self.bridge.begin_turn(sid, inp["input_id"])
+                conv.add_conv_event(
+                    self.svc, session_id=sid, type="turn.started",
+                    source=self.bridge.name, agent_id=agent_id,
+                    turn_id=turn_id, payload={"input_id": inp["input_id"]})
             receipt = self.bridge.send_prompt(binding, inp)
             stop = (receipt or {}).get("stopReason") or "end_turn"
             fin = "cancelled" if stop == "cancelled" else "completed"
             if hasattr(self.bridge, "finalize_turn"):
-                self.bridge.finalize_turn(binding["session_id"], fin)
+                self.bridge.finalize_turn(sid, fin)
+            if has_turn_api:
+                conv.add_conv_event(
+                    self.svc, session_id=sid,
+                    type="turn.cancelled" if stop == "cancelled"
+                    else "turn.completed",
+                    source=self.bridge.name, agent_id=agent_id, turn_id=turn_id,
+                    payload={"stop_reason": stop})
             if stop == "cancelled":
                 conv.set_input_state(self.svc, inp["input_id"], "cancelled",
-                                     upstream_input_id=(receipt or {}).get("inputId"))
+                                     upstream_input_id=(receipt or {}).get("inputId"),
+                                     turn_id=turn_id)
             else:
                 conv.set_input_state(self.svc, inp["input_id"], "completed",
                                      upstream_input_id=(receipt or {}).get("inputId"),
-                                     turn_id=(receipt or {}).get("turn_id"))
+                                     turn_id=turn_id)
         except HiveError as e:
             self._fail_input(agent_id, e)
             self.svc.logger.error("conv.dispatch_failed", agent=agent_id,
