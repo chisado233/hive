@@ -788,3 +788,10 @@ code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
   .project-picker select { max-width: 92px; padding: 6px 4px; font-size: 12.5px; }
   .decide-entry { padding: 7px 9px; gap: 5px; }
 }
+
+/* FDEF-02：上游状态条（与 SSE 传输状态分开呈现） */
+.conv-upstream {
+  padding: 7px 16px; font-size: 12.5px; color: var(--amber-hi);
+  background: var(--amber-dim); border-bottom: 1px solid rgba(216,187,134,.25);
+  display: flex; gap: 12px; align-items: center; flex: none;
+}

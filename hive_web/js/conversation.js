@@ -24,6 +24,8 @@ export class ConversationPane {
     this.destroyed = false;
     this._lastEventAt = Date.now();
     this._lastKnownActive = null;   // 上次权威校对的活动输入状态
+    this._lastTexts = new Map();    // 增量归并：消息 id → 已渲染文本
+    this._tailGen = 0;              // 异步代次守卫（旧响应不覆盖新状态）
     this._watchdog = null;
   }
 
@@ -360,14 +362,27 @@ export class ConversationPane {
       const d = await fetch(`/ui/api/agent/${this.agentId}/conversation/inputs`,
         { headers: { "X-Requested-With": "hive-ui" } }).then(r => r.json());
       const items = (d.data?.items || []).filter(i =>
-        ["queued", "dispatched", "running"].includes(i.state));
-      this.queueBar.classList.toggle("hidden", !items.length);
-      if (items.length) {
+        ["queued", "dispatched", "running", "cancelling"].includes(i.state));
+      const unknown = (d.data?.items || []).filter(i =>
+        i.state === "outcome_unknown");
+      this.queueBar.classList.toggle("hidden", !items.length && !unknown.length);
+      if (items.length || unknown.length) {
         this.queueBar.textContent = "";
-        this.queueBar.append(el("span", {}, "队列: "));
-        for (const i of items)
-          this.queueBar.append(el("span", { class: "tag cyan" },
-            `${i.state} ${shortId(i.input_id)}`));
+        if (items.length) {
+          this.queueBar.append(el("span", {}, "队列: "));
+          for (const i of items)
+            this.queueBar.append(el("span", { class: "tag cyan" },
+              `${i.state} ${shortId(i.input_id)}`));
+        }
+        // FDEF-01：unknown 输入的原位处置入口（只读重对账；人工收口走 confirm）
+        for (const u of unknown.slice(0, 3)) {
+          const chip = el("span", { class: "tag amber",
+            title: u.error || "结果未知（未自动判定）" },
+            `未知 ${shortId(u.input_id)}`);
+          const btn = el("button", { class: "btn btn-ghost btn-sm" }, "对账");
+          btn.onclick = () => this._reconcileAction(u.input_id);
+          this.queueBar.append(chip, btn);
+        }
       }
     } catch { /* 忽略 */ }
   }
@@ -424,6 +439,14 @@ export class ConversationPane {
     this._watchdog = setInterval(async () => {
       if (this.destroyed || !this.es) return;
       const silentMs = Date.now() - this._lastEventAt;
+      // FDEF-02 §5：上游桥状态独立轮询（SSE 心跳活着不代表桥活着）
+      try {
+        const u = await fetch(`/ui/api/agent/${this.agentId}/conversation`,
+          { headers: { "X-Requested-With": "hive-ui" } }).then(r => r.json());
+        if (u.ok) this._upstreamState(u.data?.upstream,
+          u.data?.active_input, silentMs);
+      } catch { /* 传输层由 onerror 处理 */ }
+      if (this.destroyed || !this.es) return;
       if (silentMs < 18000) return;
       try {
         const d = await fetch(
@@ -445,14 +468,100 @@ export class ConversationPane {
     }, 8000);
   }
 
+  // FDEF-02 §5：连接与运行状态分开呈现（不互相覆盖）
+  _upstreamState(up, active, silentMs) {
+    if (!this._upBar) {
+      this._upBar = el("div", { class: "conv-upstream hidden" });
+      this.host.insertBefore(this._upBar, this.host.firstChild);
+    }
+    let text = null;
+    if (up && up.bridge_alive === false)
+      text = "上游连接中断，正在恢复——已显示内容与草稿保留";
+    else if (up && up.unknown_inputs > 0 && !active)
+      text = "有待对账的历史输入（结果未知未自动判定）";
+    else if (silentMs > 18000 && active)
+      text = null;   // 下方 resync 分支负责
+    this._upBar.classList.toggle("hidden", !text);
+    if (text) {
+      this._upBar.textContent = "";
+      this._upBar.append(el("span", {}, text));
+      if (up && up.unknown_inputs > 0) {
+        const btn = el("button", { class: "btn btn-ghost btn-sm" }, "重新对账");
+        btn.onclick = () => this._reconcileAction();
+        this._upBar.append(btn);
+      }
+    }
+  }
+
+  async _reconcileAction(inputId) {
+    try {
+      const r = await fetch(
+        `/ui/api/agent/${this.agentId}/conversation/reconcile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json",
+                   "X-Requested-With": "hive-ui" },
+        body: JSON.stringify({ action: "recheck", request_id: uuid(),
+                               input_id: inputId }),
+      }).then(r => r.json());
+      if (r.ok) toast("已触发只读重新对账，稍候自动收口", "info");
+      else toast(r.error?.message || "对账失败", "err", 4500);
+    } catch { toast("对账请求失败", "err"); }
+    setTimeout(() => this._refreshTail(), 4000);
+  }
+
   async _refreshTail() {
+    // FDEF-02 §6：增量更新——不清空整 Pane（保草稿/阅读位置/展开态）
+    const gen = ++this._tailGen;
     try {
       const d = await fetch(`/ui/api/agent/${this.agentId}/conversation`,
         { headers: { "X-Requested-With": "hive-ui" } }).then(r => r.json());
-      if (!d.ok) return;
-      this._renderHistory(d.data?.tail, d.data);
+      if (!d.ok || gen !== this._tailGen || this.destroyed) return;
+      this._mergeTail(d.data?.tail, d.data);
       this._refreshQueue();
     } catch { /* 忽略 */ }
+  }
+
+  _mergeTail(tail, info) {
+    if (!tail) return;
+    const live = tail.messages || [];
+    if (!this.flow || !this.flow.children.length) {
+      this._renderHistory(tail, info);   // 首次或空态才整渲染
+      return;
+    }
+    // 以稳定 id 归并：已有的就地更新（文本/状态），新的追加，缺失的移除
+    const keep = new Set(live.map(m => m.id));
+    for (const dom of [...this.rowsById.entries()]) {
+      if (!keep.has(dom[0]) && !String(dom[0]).startsWith("hist-")) {
+        dom[1].remove();
+        this.rowsById.delete(dom[0]);
+      }
+    }
+    let last = null;
+    for (const m of live) {
+      const exist = this.rowsById.get(m.id);
+      if (exist) {
+        // 就地更新正文/状态（保留 DOM：滚动位置/展开态/工具卡开合）
+        const body = exist.querySelector(".conv-msg-body");
+        if (body && (m.text || "") !== this._lastTexts.get(m.id)) {
+          body.textContent = "";
+          if (m.kind === "assistant" || m.kind === "thought")
+            body.append(renderMarkdown(m.text || ""));
+          else body.textContent = m.text || "";
+          this._lastTexts.set(m.id, m.text || "");
+        }
+        const tt = exist.querySelector(".zc-think-text");
+        if (tt && (m.text || "") !== this._lastTexts.get(m.id)) {
+          tt.textContent = m.text || "";
+          this._lastTexts.set(m.id, m.text || "");
+          this._thinkScroll(exist);   // 展开态下跟随（折叠态不受影响）
+        }
+        exist.dataset.state = m.state || "";
+      } else {
+        this._appendMessage(m);
+      }
+      last = this.rowsById.get(m.id) || last;
+    }
+    this._maybeScroll();
   }
 
   _streamState(state) {

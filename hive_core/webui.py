@@ -1078,6 +1078,17 @@ class WebUI:
                 "pending_permission": conv.pending_permission(
                     self.svc, agent_id),
             }
+            # FDEF-02 §5：连接与运行状态分离——网页/SSE 与上游桥独立呈现
+            bridge = getattr(self.svc, "conversation", None)
+            if bridge is not None:
+                alive = (getattr(bridge.bridge, "_alive", None) is not None
+                         and bridge.bridge._alive.is_set()) or \
+                    not hasattr(bridge.bridge, "_alive")
+                unknown = self.svc.store.conn.execute(
+                    "SELECT COUNT(*) FROM conv_inputs WHERE agent_id=? AND"
+                    " state='outcome_unknown'", (agent_id,)).fetchone()[0]
+                data["upstream"] = {"bridge_alive": bool(alive),
+                                    "unknown_inputs": unknown}
             # 上游历史：实例的真实 ZCode 会话内容（含绑定前的历史），
             # 与桥捕获的增量（conv_events，绑定后）按时间水印拼接。
             # 无活跃实例时用最近实例的 sess 句柄做只读历史查看。
@@ -1209,6 +1220,70 @@ class WebUI:
             self._json(h, 200, {"ok": True, "request_id": rid,
                                 "data": {"answered": True}})
             return True
+        if sub == "/reconcile":
+            # FDEF-01 §3：人工对账兜底——recheck 只读重试；confirm 需
+            # owner/system + 具体结果/原生引用/原因，写审计、幂等、不改
+            # 业务 Task。观察者（human）只读不可改账。
+            self._conv_authz(subject, agent_id, "conversation.read")
+            cs = getattr(self.svc, "conversation", None)
+            if cs is None:
+                raise HiveError("NOT_IMPLEMENTED", "会话服务不可用")
+            action = data.get("action") or "recheck"
+            row = self.svc.store.conn.execute(
+                "SELECT * FROM conv_inputs WHERE input_id=? AND agent_id=?",
+                (data.get("input_id") or "", agent_id)).fetchone()
+            if not row:
+                raise HiveError("NOT_FOUND", "输入不存在或不属于该 Agent")
+            if row["state"] != "outcome_unknown":
+                # 幂等：已收口的重复请求返回现状，不二次改账
+                self._json(h, 200, {"ok": True, "request_id": rid,
+                                    "data": {"already": True,
+                                             "state": row["state"]}})
+                return True
+            if action == "recheck":
+                import threading as _th
+                _th.Thread(target=cs._safe_reconcile, daemon=True).start()
+                self._json(h, 200, {"ok": True, "request_id": rid,
+                                    "data": {"recheck": "scheduled"}})
+                return True
+            if action == "confirm":
+                if subject.subject_type not in ("owner", "system"):
+                    raise HiveError("FORBIDDEN",
+                                    "人工收口仅限管理者身份（观察者只读）")
+                outcome = data.get("outcome") or ""
+                native_ref = (data.get("native_ref") or "").strip()
+                reason = (data.get("reason") or "").strip()
+                if outcome not in ("completed", "cancelled", "failed"):
+                    raise HiveError("INVALID_ARGUMENT",
+                                    "outcome ∈ completed/cancelled/failed")
+                if not native_ref or not reason:
+                    raise HiveError(
+                        "REQUIRED_ARGUMENT",
+                        "人工收口必须提供原生引用（如 history seq/turn 标识）"
+                        "与具体原因")
+                sid = row["session_id"] or (conv.get_binding(
+                    self.svc, agent_id) or {}).get("session_id") or ""
+                with self.svc.store.write() as cur:
+                    self.svc.store.audit(
+                        cur, subject.ref, "conv.reconcile.manual",
+                        f"input:{row['input_id']}", reason, rid,
+                        {"outcome": outcome, "native_ref": native_ref,
+                         "request_id": row["request_id"]})
+                conv.set_input_state(
+                    self.svc, row["input_id"], outcome,
+                    error=None if outcome == "completed" else
+                    f"人工收口：{reason}（原生引用 {native_ref}）")
+                conv.add_conv_event(
+                    self.svc, session_id=sid, type="turn.completed"
+                    if outcome == "completed" else "system.note",
+                    source="manual-reconcile", agent_id=agent_id,
+                    turn_id=f"turn-{row['input_id']}",
+                    payload={"stop_reason": "manual", "manual": True,
+                             "native_ref": native_ref, "by": subject.ref})
+                self._json(h, 200, {"ok": True, "request_id": rid,
+                                    "data": {"confirmed": outcome}})
+                return True
+            raise HiveError("INVALID_ARGUMENT", "action ∈ recheck|confirm")
         raise HiveError("NOT_FOUND", f"会话接口不存在: {sub}")
 
     def _conversation_stream(self, h, agent_id: str, qs) -> bool:

@@ -651,6 +651,7 @@ class ConversationService:
     def tick(self):
         self._supervise_bridge()
         self._eager_attach()
+        self._periodic_reconcile()
         rows = self.svc.store.conn.execute(
             "SELECT DISTINCT agent_id FROM conv_inputs WHERE state='queued'"
         ).fetchall()
@@ -696,6 +697,25 @@ class ConversationService:
             self.reconcile_once()
         except Exception as e:  # noqa: BLE001
             self.svc.logger.error("conv.reconcile_failed", error=repr(e))
+
+    def _periodic_reconcile(self):
+        """FDEF-01：存在 unknown 输入且桥活着时，每 30s 低频对账
+        （目标 ≤60s 内按原生依据收口；合法长轮不受影响——working 会话
+        的归属对账直接跳过）。"""
+        if not self._bridge_ready():
+            return
+        import time as _t
+        if _t.monotonic() < getattr(self, "_next_reconcile", 0):
+            return
+        n = self.svc.store.conn.execute(
+            "SELECT COUNT(*) FROM conv_inputs WHERE state='outcome_unknown'"
+        ).fetchone()[0]
+        if not n:
+            self._next_reconcile = _t.monotonic() + 30
+            return
+        self._next_reconcile = _t.monotonic() + 30
+        threading.Thread(target=self._safe_reconcile, daemon=True,
+                         name="conv-reconcile-periodic").start()
 
     def _eager_attach(self):
         """把活跃 zsession 实例的会话接到桥上（只读 attach，不启动实例、
@@ -879,8 +899,13 @@ class ConversationService:
             pass
 
     def reconcile_once(self):
-        """RDEF-04：桥（重）连后对 outcome_unknown 输入做持久对账——按上游
-        事实补账；无凭据/未落账保持 unknown，禁止把未知写成完成。"""
+        """FDEF-01/RDEF-04：unknown 输入对账——三层：
+        1) 上游持久登记 done/cancelled/rejected/failed → 按事实收口；
+        2) started/unknown + 会话空闲 → 原生归属对账：在 /sessions/:id/history
+           中精确匹配本输入全文的 user 回显（我方原文的 1:1 身份链接，非
+           正文相似），其后存在 assistant 终稿且会话已空闲 → 按事实补
+           completed（attribution 记录依据）；
+        3) 无强证据保持 unknown（前端显示处置入口），不猜、不重发。"""
         if not hasattr(self.bridge, "query_input_state"):
             return
         rows = self.svc.store.conn.execute(
@@ -893,16 +918,9 @@ class ConversationService:
             st = self.bridge.query_input_state(sid, inp["request_id"])
             state = st.get("state")
             if state == "done":
-                conv.set_input_state(self.svc, inp["input_id"], "completed",
-                                     error=None,
-                                     upstream_input_id=st.get("inputId"),
-                                     turn_id=f"turn-{inp['input_id']}")
-                conv.add_conv_event(
-                    self.svc, session_id=sid, type="turn.completed",
-                    source="reconcile", agent_id=inp["agent_id"],
-                    turn_id=f"turn-{inp['input_id']}",
-                    payload={"stop_reason": st.get("stopReason"),
-                             "reconciled": True})
+                self._settle_reconciled(inp, sid, "completed",
+                                        st.get("stopReason") or "end_turn",
+                                        {"layer": "registry"})
             elif state == "cancelled":
                 conv.set_input_state(self.svc, inp["input_id"], "cancelled",
                                      error=None)
@@ -913,10 +931,70 @@ class ConversationService:
             elif state == "failed":
                 conv.set_input_state(self.svc, inp["input_id"], "failed",
                                      error="对账：上游登记 failed")
-            # accepted/started/reserved/unknown：保留 outcome_unknown
-            # （上游 idle 不代表旧输入成功——不猜）
+            elif state in ("started", "unknown", None):
+                self._reconcile_by_native_history(inp, sid, st)
+            # accepted/reserved：仍在途，保留 unknown 待下轮
         if rows:
             self.svc.logger.info("conv.reconciled", count=len(rows))
+
+    def _settle_reconciled(self, inp, sid: str, terminal: str,
+                           stop_reason: str, evidence: dict):
+        # 状态条件更新（终态不被覆盖）+ 事件 DB 幂等（重复对账不双写）
+        conv.set_input_state(self.svc, inp["input_id"], terminal, error=None,
+                             turn_id=f"turn-{inp['input_id']}")
+        conv.add_conv_event(
+            self.svc, session_id=sid, type="turn.completed", source="reconcile",
+            agent_id=inp["agent_id"], turn_id=f"turn-{inp['input_id']}",
+            payload={"stop_reason": stop_reason, "reconciled": True,
+                     **evidence},
+            dedupe_key=f"reconcile-settle-{inp['input_id']}")
+
+    def _reconcile_by_native_history(self, inp, sid: str, st: dict):
+        """原生归属对账（FDEF-01 核心）：只在「会话当前空闲」时尝试——
+        working/waiting 说明轮次可能仍在跑（保留 unknown，不提前 completed）。"""
+        try:
+            from .zsession_read import _get
+            info = _get(self.svc, f"/sessions/{sid}")
+            status = info.get("status")
+            if status in ("working", "waiting_input", "spawning"):
+                return                       # 仍在跑：可理解的"恢复中"
+            # 空闲族（idle/inactive/dead/archived 等）：允许按历史归属对账；
+            # 未知状态值不冒进，跳过等待下轮
+            if status not in ("idle", "inactive", "dead", "archived", None):
+                return
+            hist = _get(self.svc, f"/sessions/{sid}/history?limit=200") \
+                if status != "archived" else {"items": []}
+            items = hist.get("items") or []
+            want = (inp["text"] or "").strip()
+            if not want:
+                return
+            # 找本输入全文的 user 回显（1:1 身份链接；时间窗仅辅助定位）
+            match_idx = None
+            for i, it in enumerate(items):
+                if it.get("role") == "user" and \
+                        (it.get("text") or "").strip() == want:
+                    match_idx = i
+            if match_idx is None:
+                return                       # 无归属证据：保留 unknown+入口
+            # 其后存在 assistant 终稿 → 该轮已自然完成
+            has_answer = any(
+                it.get("role") == "assistant" and (it.get("text") or "").strip()
+                for it in items[match_idx + 1:])
+            if not has_answer:
+                return
+            self._settle_reconciled(
+                inp, sid, "completed", "end_turn",
+                {"layer": "native-history",
+                 "attribution": "user-echo-exact-match",
+                 "registry_state": st.get("state"),
+                 "native_input_id": st.get("inputId")})
+            self.svc.logger.info(
+                "conv.reconcile_native", input=inp["input_id"][-8:],
+                session=sid[-8:])
+        except Exception as e:  # noqa: BLE001
+            self.svc.logger.warning("conv.reconcile_native_failed",
+                                    input=inp["input_id"][-8:],
+                                    error=repr(e)[:160])
 
     def stop(self):
         self.bridge.close()

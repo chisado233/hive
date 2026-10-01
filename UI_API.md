@@ -114,3 +114,20 @@ control test *、system 管理类、permission grant/revoke 等不在白名单�
   弱模式（默认）ensure 前自动释放本方残留 claim（兼容路径，强模式不触发）。
 - **busy 合同**：-32011 → 同 requestId 回队（10s 退避）；新合同
   retryable_busy 非终态，不触发派生 ID；不假 turn.started、不自动 interrupt。
+
+## 8. 第五轮修订（FDEF 修复后）
+
+- **unknown 自动收口（FDEF-01）**：周期对账（30s，桥活+有 unknown 时）三层：
+  ① 上游登记终态按事实收口；② started/unknown+会话空闲 → 原生归属对账
+  （history 精确匹配本输入全文 user 回显 + 其后 assistant 终稿 → completed，
+  证据 attribution/registry_state/native_input_id）；③ 无强证据保持 unknown。
+  会话 working 时不收口（合法长轮不受影响）。settle 事件 DB 幂等。
+- **人工对账兜底**：`POST /ui/api/agent/:id/conversation/reconcile`
+  `{action:"recheck"|"confirm", input_id, request_id, outcome?, native_ref?, reason?}`。
+  recheck=只读重试（conversation.read）；confirm=人工收口（仅 owner/system，
+  必须 outcome+native_ref+reason，audit_log 记录，非 unknown 幂等返回 already）。
+  观察者只读不可改账；聊天/评论不改账。
+- **会话面板状态（FDEF-02）**：`GET …/conversation` 新增
+  `upstream: {bridge_alive, unknown_inputs}`（网页/SSE 与上游桥状态分离）；
+  前端增量归并（不清空 Pane，保留草稿/滚动/折叠态）+ 上游状态条 +
+  重新对账按钮。未知输入在队列条显示「未知 + 对账」入口。
