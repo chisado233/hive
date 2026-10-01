@@ -1052,10 +1052,19 @@ class WebUI:
                     self.svc, agent_id),
             }
             # 上游历史：实例的真实 ZCode 会话内容（含绑定前的历史），
-            # 与桥捕获的增量（conv_events，绑定后）按时间水印拼接
+            # 与桥捕获的增量（conv_events，绑定后）按时间水印拼接。
+            # 无活跃实例时用最近实例的 sess 句柄做只读历史查看。
             session_id = (binding or {}).get("session_id")
             if not session_id and inst and (inst["handle"] or "").startswith("sess:"):
                 session_id = inst["handle"].split(":", 1)[1]
+            if not session_id:
+                last = self.svc.store.conn.execute(
+                    "SELECT handle FROM instances WHERE agent_id=? AND handle "
+                    "LIKE 'sess:%' ORDER BY generation DESC LIMIT 1",
+                    (agent_id,)).fetchone()
+                if last:
+                    session_id = last["handle"].split(":", 1)[1]
+                    data["historical_session"] = True
             if session_id:
                 from . import zsession_read as zr
                 try:

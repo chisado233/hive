@@ -480,6 +480,7 @@ class ConversationService:
 
     def tick(self):
         self._supervise_bridge()
+        self._eager_attach()
         rows = self.svc.store.conn.execute(
             "SELECT DISTINCT agent_id FROM conv_inputs WHERE state='queued'"
         ).fetchall()
@@ -517,6 +518,47 @@ class ConversationService:
             self.svc.logger.info("acp.reconnected")
         except Exception as e:  # noqa: BLE001
             self.svc.logger.error("acp.restart_failed", error=repr(e))
+
+    def _eager_attach(self):
+        """把活跃 zsession 实例的会话接到桥上（只读 attach，不启动实例、
+        不发送内容）：会话舱对任意在跑 Agent 实时同步。每 tick 最多 2 个，
+        失败冷却 60s。"""
+        if not hasattr(self.bridge, "_alive") or not self.bridge._alive.is_set():
+            return
+        rows = self.svc.store.conn.execute(
+            "SELECT i.* FROM instances i WHERE i.phase IN ('live','starting') "
+            "AND i.handle LIKE 'sess:%' ORDER BY i.started_at").fetchall()
+        import time as _t
+        budget = 2
+        for inst in rows:
+            if budget <= 0:
+                break
+            agent_id = inst["agent_id"]
+            b = conv.get_binding(self.svc, agent_id)
+            if b and b["instance_id"] == inst["instance_id"] and \
+                    b["session_id"] in getattr(self.bridge, "_loaded_sessions", set()):
+                continue
+            if self._cooldown.get("attach:" + agent_id, 0) > _t.monotonic():
+                continue
+            if agent_id in self._working:
+                continue
+            self._working.add(agent_id)
+            budget -= 1
+            threading.Thread(target=self._attach_one, args=(dict(inst),),
+                             daemon=True,
+                             name=f"conv-attach-{agent_id[-6:]}").start()
+
+    def _attach_one(self, inst: dict):
+        agent_id = inst["agent_id"]
+        try:
+            self.bridge.ensure(agent_id, inst)
+        except Exception as e:  # noqa: BLE001
+            import time as _t
+            self._cooldown["attach:" + agent_id] = _t.monotonic() + 60
+            self.svc.logger.warning("conv.attach_failed", agent=agent_id,
+                                    error=repr(e)[:200])
+        finally:
+            self._working.discard(agent_id)
 
     def _dispatch_one(self, agent_id: str, inst: dict):
         try:

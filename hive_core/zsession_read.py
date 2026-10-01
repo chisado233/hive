@@ -1,25 +1,103 @@
 """从 zsession daemon 读取会话历史（只读，服务端使用；token 不下发浏览器）。
 
-历史来源：daemon /events 事件流中的 session_row 行（row.appended/upserted/
-delta，含完整行对象）。上游 /sessions/:id/messages 在 websocket 模式存在
-schema 缺陷（info.messageId undefined → 500），故走事件流重建。
-限制：深度受 daemon 事件留存约束；在响应中以 note 如实标注。
+历史来源优先级：
+1. daemon 磁盘事件日志 ~/.zcode/zsession/events/events.jsonl（全量留存，
+   daemon 内存环只有 5000 条，老的会话行早已滚出——这是"历史缺失"的根因）
+2. daemon HTTP /events（内存环，兜底）
+
+上游 /sessions/:id/messages 在 websocket 模式存在 schema 缺陷
+（info.messageId undefined → 500），不在 Hive 侧修上游，走事件流行重建。
 """
 from __future__ import annotations
 
 import json
+import os
 
 from .errors import HiveError
 
+EVENTS_FILE = os.path.expanduser(os.path.join(
+    "~", ".zcode", "zsession", "events", "events.jsonl"))
+
+# (session_id) -> (file_size, mtime, messages)
+_history_cache: dict[str, tuple] = {}
+MAX_ROWS_PER_SESSION = 600
+
+
+def _iter_session_rows_file(session_id: str):
+    """从磁盘事件日志重建该会话的行序列（op 序应用）。"""
+    if not os.path.exists(EVENTS_FILE):
+        raise HiveError("HARNESS_UNAVAILABLE", "zsession 事件日志不存在")
+    rows: dict[str, dict] = {}
+    order: list[str] = []
+    with open(EVENTS_FILE, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            # 粗筛：行里不含 sessionId 直接跳过（90MB 文件的关键性能点）
+            if session_id not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("sessionId") != session_id or ev.get("type") != "session_row":
+                continue
+            d = ev.get("data") or {}
+            row = d.get("row")
+            op = d.get("op")
+            rid = d.get("rowId") or (row or {}).get("rowId")
+            if rid is None:
+                continue
+            if op in ("row.appended", "row.upserted") and row:
+                rows[rid] = row
+                if rid not in order:
+                    order.append(rid)
+            elif op == "row.delta" and rid in rows:
+                if isinstance(d.get("append"), str):
+                    rows[rid]["text"] = (rows[rid].get("text") or "") + d["append"]
+            elif op == "row.removed":
+                rows.pop(rid, None)
+    return rows, order
+
+
+def _rows_to_messages(rows: dict, order: list) -> list[dict]:
+    messages = []
+    for rid in order[-MAX_ROWS_PER_SESSION:]:
+        row = rows.get(rid)
+        if not row:
+            continue
+        kind = row.get("kind")
+        text = row.get("text") or ""
+        state = row.get("state") or row.get("status") or "completed"
+        if kind == "userInput":
+            messages.append({"kind": "user", "text": text, "state": "completed",
+                             "at": None, "source": "history"})
+        elif kind == "assistantText":
+            messages.append({"kind": "assistant", "text": text,
+                             "state": "completed", "at": None,
+                             "source": "history"})
+        elif kind == "reasoning":
+            messages.append({"kind": "thought", "text": text,
+                             "state": "completed", "at": None,
+                             "source": "history"})
+        elif kind == "toolCall":
+            messages.append({"kind": "tool",
+                             "tool": row.get("toolName") or "tool",
+                             "title": (row.get("inputText") or "")[:120],
+                             "state": {"success": "completed",
+                                       "error": "failed",
+                                       "cancelled": "cancelled"}.get(
+                                           state, "completed"),
+                             "result": (row.get("outputText") or "")[:1000],
+                             "error": (row.get("errorText") or "")[:500] or None,
+                             "at": None, "source": "history"})
+    return messages
+
 
 def _daemon_cfg(svc):
-    import json as _json
-    import os
     path = os.path.expanduser(os.path.join("~", ".zcode", "zsession",
                                            "config.json"))
     if not os.path.exists(path):
         raise HiveError("HARNESS_UNAVAILABLE", "zsession 配置不存在")
-    cfg = _json.load(open(path, encoding="utf-8"))
+    cfg = json.load(open(path, encoding="utf-8"))
     token = (cfg.get("tokens") or {}).get("owner-local", {}).get("token")
     if not token:
         raise HiveError("HARNESS_UNAVAILABLE", "zsession owner-local token 未配置")
@@ -56,7 +134,22 @@ def fetch_session_state(svc, session_id: str) -> dict:
 
 
 def fetch_session_history(svc, session_id: str, limit: int = 3000) -> dict:
-    """从 daemon 事件流重建会话历史。返回按序消息行（真实行级内容）。"""
+    """优先磁盘全量日志（带 mtime 缓存），缺失时退回 daemon 内存环。"""
+    if os.path.exists(EVENTS_FILE):
+        st = os.stat(EVENTS_FILE)
+        cached = _history_cache.get(session_id)
+        if cached and cached[0] == st.st_size and cached[1] == st.st_mtime:
+            return {"messages": cached[2], "note": None,
+                    "count": len(cached[2])}
+        rows, order = _iter_session_rows_file(session_id)
+        messages = _rows_to_messages(rows, order)
+        _history_cache[session_id] = (st.st_size, st.st_mtime, messages)
+        if len(_history_cache) > 40:
+            _history_cache.pop(next(iter(_history_cache)))
+        return {"messages": messages,
+                "note": None if messages else None,
+                "count": len(messages)}
+    # 兜底：daemon 内存环
     data = _get(svc, f"/events?cursor=0&limit={limit}")
     events = data.get("events") or []
     rows: dict[str, dict] = {}
@@ -75,44 +168,11 @@ def fetch_session_history(svc, session_id: str, limit: int = 3000) -> dict:
             if rid not in order:
                 order.append(rid)
         elif op == "row.delta" and rid in rows:
-            # 字符级增量补到最新文本（历史重建只需最终文本）
             if isinstance(d.get("append"), str):
-                cur = rows[rid]
-                cur["text"] = (cur.get("text") or "") + d["append"]
+                rows[rid]["text"] = (rows[rid].get("text") or "") + d["append"]
         elif op == "row.removed":
             rows.pop(rid, None)
-    messages = []
-    for rid in order:
-        row = rows.get(rid)
-        if not row:
-            continue
-        kind = row.get("kind")
-        text = row.get("text") or ""
-        state = row.get("state") or row.get("status") or "completed"
-        if kind == "userInput":
-            messages.append({"kind": "user", "text": text, "state": "completed",
-                             "at": None, "source": "history"})
-        elif kind == "assistantText":
-            messages.append({"kind": "assistant", "text": text,
-                             "state": "completed", "at": None,
-                             "source": "history"})
-        elif kind == "reasoning":
-            messages.append({"kind": "thought", "text": text,
-                             "state": "completed", "at": None,
-                             "source": "history"})
-        elif kind == "toolCall":
-            messages.append({"kind": "tool",
-                             "tool": row.get("toolName") or "tool",
-                             "title": (row.get("inputText") or "")[:120],
-                             "state": {"success": "completed",
-                                       "error": "failed",
-                                       "cancelled": "cancelled"}.get(
-                                           state, "completed"),
-                             "result": (row.get("outputText") or "")[:1000],
-                             "error": (row.get("errorText") or "")[:500] or None,
-                             "at": None, "source": "history"})
-    truncated = len(events) >= limit
+    messages = _rows_to_messages(rows, order)
     return {"messages": messages,
-            "note": ("历史来自 zsession 事件流留存；更早内容以 ZCode 会话本体为准"
-                     if truncated else None),
+            "note": "历史来自 daemon 内存事件环，早期内容可能已滚出",
             "count": len(messages)}
