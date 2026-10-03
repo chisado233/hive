@@ -2568,7 +2568,7 @@ YOLO/共享系统账号接入档中的Hive权限是正规API调用的授权边�
 
 ### 20.1 使用技能与项目设计交付
 
-本机技能位于 `D:/agent_workspace/capability-library/skill-library/hive/SKILL.md`，通过 `mycli skill-library search hive` 发现。它用于设计、配置、部署和运行Hive应用项目，Apache Hive数据仓库不在其范围。
+配套使用技能（SKILL.md）位于作者工作区技能库 capability-library/skill-library/hive/，未随本仓库发布。它用于设计、配置、部署和运行Hive应用项目，Apache Hive数据仓库不在其范围。
 
 每个新项目的DESIGN正文必须写清：目标与每轮交付、资产归属、Agent及独立工位、端口与订阅、输入输出、任务血缘/等待/回调、模型与权限、人工决定、触发/预算/恢复、部署入口以及本节Agent守则。不能把必需约定只放聊天或某个Agent私有prompt。
 
@@ -2657,10 +2657,10 @@ YOLO/共享系统账号接入档中的Hive权限是正规API调用的授权边�
 ### 20.6 维护入口
 
 - 项目部署摘要：[DEPLOYMENT.md](DEPLOYMENT.md)。
-- 完整使用技能：[SKILL.md](../../capability-library/skill-library/hive/SKILL.md)。
-- 启动者完整步骤：[DEPLOY.md](../../capability-library/skill-library/hive/DEPLOY.md)。
-- 新项目设计模板：[PROJECT_DESIGN.template.md](../../capability-library/skill-library/hive/assets/PROJECT_DESIGN.template.md)。
-- 守则维护源：[AGENT_RULES.md](../../capability-library/skill-library/hive/references/AGENT_RULES.md)。
+- 完整使用技能：SKILL.md（工作区技能库，未随本仓库发布）。
+- 启动者完整步骤：DEPLOY.md（同上）。
+- 新项目设计模板：PROJECT_DESIGN.template.md（同上）。
+- 守则维护源：AGENT_RULES.md（同上）。
 
 同步维护时保留本节与技能核心语义一致。完整CLI参数继续由第14节、当前CLI帮助与manifest提供，技能不再复制另一份97命令清单。
 

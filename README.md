@@ -4,16 +4,17 @@
 [DESIGN.md](DESIGN.md) / [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) /
 [ACCEPTANCE.md](ACCEPTANCE.md) 施工，零第三方依赖（Python 3.11+ 标准库）。
 
-## 项目搭建与使用技能
+## 项目搭建与部署
 
-新项目搭建者先读本机 [Hive 使用技能](../../capability-library/skill-library/hive/SKILL.md)，或运行 `mycli skill-library search hive` 定位。启动者读 [DEPLOYMENT.md](DEPLOYMENT.md) 和技能中的完整 [DEPLOY.md](../../capability-library/skill-library/hive/DEPLOY.md)。
+新项目搭建与部署步骤见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 项目设计必须包含Agent运行守则，见 [DESIGN.md 第20节](DESIGN.md#20-项目搭建部署与-agent-使用守则)。共享运行根使用runtime.options.execution_root，每个Agent继续保留独立workspace.path；配置导入源与工位生成视图分别维护。
 
 ## 30 秒启动
 
 ```bash
-cd D:\agent_workspace\valuable-projects\hive
+git clone https://github.com/chisado233/hive.git
+cd hive
 
 # 1) 初始化独立数据根（生产模式，默认端口 19962）
 python cli/hive.py --home .hive control system init

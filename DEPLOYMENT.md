@@ -2,13 +2,13 @@
 
 维护日期：2026-10-01。给负责把已经设计好的项目接入真实Hive的启动者。
 
-完整操作、PowerShell示例与故障接续见本机技能库的 [DEPLOY.md](../../capability-library/skill-library/hive/DEPLOY.md)。项目设计与配置编写先读 [Hive 使用技能](../../capability-library/skill-library/hive/SKILL.md)。
+完整操作、PowerShell示例与故障接续见配套技能库的 DEPLOY.md；项目设计与配置编写先读技能库的 SKILL.md。技能库（capability-library/skill-library/hive/）属作者工作区资产，未随本仓库发布。
 
 ## 1. 带齐本项目参数
 
 从项目DESIGN/DEPLOYMENT/台账读取：PROJECT_ROOT、Hive home和endpoint、凭据文件位置、Agent配置源与独立工位、harness与模型、端口/订阅/权限、人工通道、激活范围及第一项任务。凭据正文不写在这些文件中。
 
-使用 `python -X utf8 D:/agent_workspace/valuable-projects/hive/cli/hive.py`，或已实际登记且核对过的包装入口。mycli skill-library负责检索技能，不等于已存在mycli hive业务命令。
+使用 `python -X utf8 cli/hive.py`（在仓库根目录执行），或已实际登记且核对过的包装入口。
 
 ## 2. 按依赖接线
 
