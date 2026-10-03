@@ -293,7 +293,7 @@ def op_start_agent(svc, subject, agent_id: str, callback, rid=None,
             "outcome_unknown": start_fault}
 
 
-def op_wake_agent(svc, subject, agent_id: str, message: str) -> dict:
+def op_wake_agent(svc, subject, agent_id: str, message: str, rid=None) -> dict:
     from .agents import get_agent, get_agent_config
     row = get_agent(svc, agent_id)
     cfg = get_agent_config(svc, agent_id)
@@ -307,7 +307,7 @@ def op_wake_agent(svc, subject, agent_id: str, message: str) -> dict:
     if existing:
         # merge into a pending notification (dedupe per agent)
         _queue_notification(svc, agent_id, message or "请查看inbox",
-                            dedupe="wake")
+                            dedupe=f"wake:{rid or new_id('request')}")
         return {"operation_id": None, "coalesced": True,
                 "instance_id": existing["instance_id"]}
     if not cfg.get("runtime", {}).get("auto_start", True):
@@ -400,10 +400,11 @@ def op_send_agent(svc, subject, agent_id: str, args, rid) -> dict:
         delivery = "send" if result == "accepted" else "queued-retry"
         if result != "accepted":
             _queue_notification(svc, agent_id, text or "请查看inbox",
-                                dedupe="send")
+                                dedupe=f"send:{rid or new_id('request')}")
         return {"operation_id": None, "delivery_mode": delivery,
                 "degraded": False, "send_result": result}
-    _queue_notification(svc, agent_id, text or "请查看inbox", dedupe="send")
+    _queue_notification(svc, agent_id, text or "请查看inbox",
+                        dedupe=f"send:{rid or new_id('request')}")
     return {"operation_id": None, "delivery_mode": "queue", "degraded": False}
 
 

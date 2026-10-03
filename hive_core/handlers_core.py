@@ -265,7 +265,7 @@ def h_agent_wake(svc, subject, args, rid):
     get_agent(svc, args["agent"])
     svc.authz.require(subject, "agent.start", f"agent:{args['agent']}")
     from .runtime_ops import op_wake_agent
-    return op_wake_agent(svc, subject, args["agent"], args.get("message"))
+    return op_wake_agent(svc, subject, args["agent"], args.get("message"), rid)
 
 
 def h_agent_send(svc, subject, args, rid):

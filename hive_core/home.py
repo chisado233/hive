@@ -75,13 +75,32 @@ def process_alive(pid: int) -> bool:
         return False
     try:
         if sys.platform == "win32":
+            from ctypes import wintypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
             kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                            wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                          False, int(pid))
             if not handle:
                 return False
-            kernel32.CloseHandle(handle)
-            return True
+            try:
+                # An exited process can still have open handles and therefore
+                # OpenProcess succeeds. Only STILL_ACTIVE means it is running;
+                # otherwise stale daemon locks would block all future starts.
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True  # cannot prove exit: retain single-writer fence
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         os.kill(pid, 0)
         return True
     except OSError:

@@ -66,14 +66,23 @@ def _task_candidates(cur, svc, task_id: str, target: str,
 
 def notify_new_task(svc, cur, task_id: str, target: str, task_type: str,
                     dedupe_prefix: str | None = None):
-    """Queue candidate notifications inside the creation transaction."""
+    """Deduplicate one task/routing epoch, never a port's entire lifetime.
+
+    Separate task signals remain durable; run_notifications coalesces the
+    signals captured in one send batch, without swallowing later arrivals.
+    """
+    task = cur.execute("SELECT spec_version, claim_epoch FROM tasks WHERE "
+                       "task_id=?", (task_id,)).fetchone()
+    spec = task["spec_version"] if task else 1
+    epoch = task["claim_epoch"] if task else 0
     for agent_id in _task_candidates(cur, svc, task_id, target, task_type):
+        scope = (f"port:{target[5:]}" if target.startswith("port:")
+                 else f"personal:{agent_id}")
         _queue_notif(cur, agent_id,
-                     dedupe_prefix or (f"port:{target[5:]}"
-                                       if target.startswith("port:")
-                                       else f"personal:{agent_id}"),
-                     "端口有新任务待领取" if target.startswith("port:")
-                     else "新的个人投递待处理", svc)
+                     dedupe_prefix or
+                     f"{scope}:task:{task_id}:v{spec}:e{epoch}",
+                     "端口有新任务待领取，请查看 inbox" if target.startswith("port:")
+                     else "新的个人投递待处理，请查看 inbox", svc)
 
 
 
@@ -120,12 +129,40 @@ class Scheduler:
 
     def notify_port_resumed(self, port_id: str):
         with self.svc.store.write() as cur:
-            cur.execute(
-                "INSERT OR IGNORE INTO notifications(notify_id,agent_id,dedupe_key,"
-                "message,state,created_at) SELECT ?, agent_id, ?, '端口已恢复领取，"
-                "有待领任务', 'pending', ? FROM subscriptions WHERE port_id=? AND "
-                "enabled=1", (new_id("view"), f"portresumed:{port_id}",
-                              self.svc.now(), port_id))
+            # Each resume is a new wake. Each subscriber also needs its own
+            # notify_id (one INSERT SELECT id silently dropped all but one).
+            wake = f"portresumed:{port_id}:{new_id('view')}"
+            subscribers = cur.execute(
+                "SELECT agent_id FROM subscriptions WHERE port_id=? AND "
+                "enabled=1", (port_id,)).fetchall()
+            for sub in subscribers:
+                _queue_notif(cur, sub["agent_id"], wake,
+                             "端口已恢复领取，有待领任务，请查看 inbox", self.svc)
+
+    def _reconcile_page(self, cutoff: str):
+        """Persist a fair keyset cursor, including skipped/exhausted rows.
+
+        The next tick proceeds past this page even when none of its tasks
+        can be woken. Wrap after the last page so changed candidates/caps
+        are reevaluated. Historical queued rows are retained unchanged.
+        """
+        cursor = self.svc.store.kv_get("wake_scan_cursor", {}) or {}
+        after = (cursor.get("created_at", ""), cursor.get("task_id", "")) \
+            if isinstance(cursor, dict) else ("", "")
+        sql = (
+            "SELECT t.task_id, t.target, t.type, t.spec_version, t.created_at "
+            "FROM tasks t WHERE t.state='queued' AND t.type IN "
+            "('work','notice','message','receipt') AND t.created_at<=? "
+            "AND (t.created_at,t.task_id)>(?,?) "
+            "ORDER BY t.created_at,t.task_id LIMIT 50")
+        rows = self.svc.store.conn.execute(sql, (cutoff, *after)).fetchall()
+        if not rows and after != ("", ""):
+            rows = self.svc.store.conn.execute(sql, (cutoff, "", "")).fetchall()
+        last = rows[-1] if rows else None
+        self.svc.store.kv_set("wake_scan_cursor", {
+            "created_at": last["created_at"] if last else "",
+            "task_id": last["task_id"] if last else ""})
+        return rows
 
     def _loop(self):
         while not self._stop.is_set():
@@ -384,11 +421,7 @@ class Scheduler:
             cur.execute(
                 "DELETE FROM kv WHERE k LIKE 'wakeround:%' AND substr(k, 11) "
                 "NOT IN (SELECT task_id FROM tasks WHERE state='queued')")
-        stuck = svc.store.conn.execute(
-            "SELECT t.task_id, t.target, t.type, t.spec_version FROM tasks t "
-            "WHERE t.state='queued' AND t.type IN "
-            "('work','notice','message','receipt') "
-            "AND t.created_at<=? LIMIT 50", (cutoff,)).fetchall()
+        stuck = self._reconcile_page(cutoff)
         for t in stuck:
             task_row = svc.store.conn.execute(
                 "SELECT * FROM tasks WHERE task_id=? AND state='queued'",
@@ -462,7 +495,7 @@ class Scheduler:
                     cur.execute(
                         "INSERT OR IGNORE INTO notifications(notify_id,agent_id,"
                         "dedupe_key,message,state,attempts,created_at) VALUES "
-                        "(?,?,?, '对账：仍有待办任务待处理','pending',0,?)",
+                        "(?,?,?, '对账：仍有待办任务待处理，请查看 inbox','pending',0,?)",
                         (new_id("view"), ag,
                          f"reconcile:{t['task_id']}:{round_no}", now))
                     inserted += cur.execute("SELECT changes()").fetchone()[0]
@@ -477,7 +510,18 @@ class Scheduler:
             "SELECT * FROM notifications WHERE state='pending' AND "
             "(send_after IS NULL OR send_after<=?)",
             (svc.now(),)).fetchall()
+        # Coalesce only the captured batch. A signal created while this I/O
+        # is in flight is not in the batch and remains pending for next tick.
+        batches = {}
         for n in rows:
+            coalescible = n["dedupe_key"].startswith(
+                ("port:", "personal:", "reconcile:", "receipt:",
+                 "portresumed:", "wake:"))
+            key = (n["agent_id"], n["message"],
+                   None if coalescible else n["notify_id"])
+            batches.setdefault(key, []).append(n)
+        for batch in batches.values():
+            n = batch[0]
             inst = svc.store.conn.execute(
                 "SELECT * FROM instances WHERE agent_id=? AND phase IN "
                 "('starting','live') ORDER BY started_at DESC LIMIT 1",
@@ -492,26 +536,30 @@ class Scheduler:
                 result = "failed"
             with svc.store.write() as cur:
                 if result in ("accepted",):
-                    cur.execute("UPDATE notifications SET state='sent', sent_at=? "
-                                "WHERE notify_id=?", (svc.now(), n["notify_id"]))
+                    cur.executemany(
+                        "UPDATE notifications SET state='sent', sent_at=? "
+                        "WHERE notify_id=? AND state='pending'",
+                        [(svc.now(), item["notify_id"]) for item in batch])
                 else:
                     # wake signals are droppable+resendable; retry paced by
                     # send_unknown_retry_after (busy/unknown merges), then drop
                     import datetime
                     from .timeutil import parse_rfc3339
-                    attempts = n["attempts"] + 1
-                    if attempts >= 3:
-                        cur.execute("DELETE FROM notifications WHERE notify_id=?",
-                                    (n["notify_id"],))
-                    else:
-                        wait = svc.policy().get("send_unknown_retry_after", 300)
-                        cur.execute(
-                            "UPDATE notifications SET attempts=?, send_after=? "
-                            "WHERE notify_id=?",
-                            (attempts, format_rfc3339(
-                                parse_rfc3339(svc.now())
-                                + datetime.timedelta(seconds=wait)),
-                             n["notify_id"]))
+                    wait = svc.policy().get("send_unknown_retry_after", 300)
+                    for item in batch:
+                        attempts = item["attempts"] + 1
+                        if attempts >= 3:
+                            cur.execute(
+                                "DELETE FROM notifications WHERE notify_id=?",
+                                (item["notify_id"],))
+                        else:
+                            cur.execute(
+                                "UPDATE notifications SET attempts=?, send_after=? "
+                                "WHERE notify_id=?",
+                                (attempts, format_rfc3339(
+                                    parse_rfc3339(svc.now())
+                                    + datetime.timedelta(seconds=wait)),
+                                 item["notify_id"]))
 
     def run_due_restarts(self):
         """RDEF-03: crash-restart plans are a recoverable state machine
